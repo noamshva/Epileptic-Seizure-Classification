@@ -1,0 +1,5 @@
+# Common Python virtual environment folders
+venv/
+.venv/
+env/
+venv3_11/
