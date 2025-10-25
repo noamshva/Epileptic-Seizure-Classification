@@ -1,0 +1,8 @@
+sctn
+torch
+numpy
+scipy
+matplotlib
+mne
+tqdm
+seaborn
