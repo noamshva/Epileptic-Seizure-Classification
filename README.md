@@ -37,7 +37,7 @@ pip install -r requirements.txt
 ##  Dataset
 
 Download the CHB-MIT EEG dataset from PhysioNet:
-👉 [https://physionet.org/content/chbmit/1.0.0/](https://physionet.org/content/chbmit/1.0.0/)
+ [https://physionet.org/content/chbmit/1.0.0/](https://physionet.org/content/chbmit/1.0.0/)
 
 Place it locally, for example:
 
@@ -91,7 +91,7 @@ CHBMIT_ROOT = r"C:\<your_path>\dataset\chbmit"
 
 ---
 
-## ▶ Typical Run Order
+##  Typical Run Order
 
 1. `python src/signal2spikes.py` → generate spike datasets
 2. `python src/pre_train_chbmit.py` → validate band power
