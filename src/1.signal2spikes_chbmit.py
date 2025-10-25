@@ -33,10 +33,11 @@ clk_resonators = {
     # 153600: [10.5, 11.5, 12.8, 15.8, 16.6, 19.4, 22.0, 24.8, 28.4, 30.5, 34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2],
 }
 
-SUBJECTS = ["chb01"]
-EDF_WHITELIST = ["chb01_03.edf"]
-ONLY_MINUTES = [49, 50, 51]
-SELECT_BIPOLAR_INDEXES = [4, 16, 13, 5, 12, 9, 10, 14, 22]   # set to None to use all available channels
+SUBJECTS = ["chb01"]              # [] → process all subjects in CHBMIT_ROOT
+EDF_WHITELIST = ["chb01_03.edf"]  # [] → include all EDF files under each subject
+ONLY_MINUTES = [49, 50, 51]       # None → process all minutes in every EDF file
+SELECT_BIPOLAR_INDEXES = [4, 16, 13, 5, 12, 9, 10, 14, 22]  # None → use all available channels
+
 
 # ============================================================
 #                   UTILS
