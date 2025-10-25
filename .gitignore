@@ -1,6 +1,47 @@
+# =========================================================
 # Virtual environments
+# =========================================================
 .venv3_11/
 venv3_11/
 .venv/
 venv/
 env/
+
+# =========================================================
+# Dataset directories (keep only structure + READMEs)
+# =========================================================
+dataset/chbmit/*
+dataset/spikes_raw/*
+dataset/spikes_windowed/*
+
+!dataset/chbmit/
+!dataset/spikes_raw/
+!dataset/spikes_windowed/
+!dataset/chbmit/README*
+!dataset/spikes_raw/README*
+!dataset/spikes_windowed/README*
+
+# =========================================================
+# Output data (trained models, logs, results)
+# =========================================================
+output_data/results/*
+output_data/train_logs/*
+output_data/trained_models/*
+
+!output_data/results/
+!output_data/train_logs/
+!output_data/trained_models/
+!output_data/results/README*
+!output_data/train_logs/README*
+!output_data/trained_models/README*
+
+# =========================================================
+# Analysis outputs (keep structure + READMEs)
+# =========================================================
+analysis/figures/*
+analysis/pretrain_stats/*
+
+!analysis/figures/
+!analysis/pretrain_stats/
+!analysis/figures/README*
+!analysis/pretrain_stats/README*
