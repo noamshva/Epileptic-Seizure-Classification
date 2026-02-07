@@ -166,10 +166,10 @@ def _run_one_resonator(args):
 
 SUMMARY_CH_LINE = re.compile(r"^\s*Channel\s+(\d+):\s*(.+?)\s*$", re.IGNORECASE)
 SEIZURE_BLOCK = re.compile(
-    r"^File Name:\s*(?P<fname>\S+)\s*$"
-    r"|^Number of Seizures in File:\s*(?P<n>\d+)\s*$"
-    r"|^Seizure\s+\d+\s+Start Time:\s*(?P<start>\d+)\s*seconds\s*$"
-    r"|^Seizure\s+\d+\s+End Time:\s*(?P<end>\d+)\s*seconds\s*$",
+    r"^\s*File\s+Name:\s*(?P<fname>\S+)"
+    r"|^\s*Number\s+of\s+Seizures\s+in\s+File:\s*(?P<n>\d+)"
+    r"|^\s*Seizure\s+\d+\s+Start\s+Time:\s*(?P<start>\d+)\s*seconds?"
+    r"|^\s*Seizure\s+\d+\s+End\s+Time:\s*(?P<end>\d+)\s*seconds?",
     re.IGNORECASE
 )
 
