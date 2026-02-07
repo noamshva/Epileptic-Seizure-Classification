@@ -209,25 +209,32 @@ def parse_summary(summary_path: str):
                 channels_by_index[idx] = label
                 channels_order.append(label)
 
-    # seizures per file
+    # seizures per file - simple string-based parsing (more robust than regex)
     current_file = None
-    starts, ends = [], []
+    current_start = None
     for ln in lines:
-        m = SEIZURE_BLOCK.match(ln)
-        if not m:
-            continue
-        gd = m.groupdict()
-        if gd.get("fname"):
-            if current_file is not None and len(starts) == len(ends):
-                seizures_by_file[current_file] = list(zip(starts, ends))
-            current_file = gd["fname"].strip()
-            starts, ends = [], []
-        elif gd.get("start"):
-            starts.append(int(gd["start"]))
-        elif gd.get("end"):
-            ends.append(int(gd["end"]))
-    if current_file is not None and len(starts) == len(ends):
-        seizures_by_file[current_file] = list(zip(starts, ends))
+        # File name
+        if 'File Name:' in ln and '.edf' in ln.lower():
+            current_file = ln.split(':', 1)[1].strip()
+
+        # Start time
+        if 'Start Time:' in ln and 'seconds' in ln.lower() and current_file:
+            try:
+                # Extract number before 'seconds'
+                current_start = int(ln.split('seconds')[0].split(':')[-1].strip())
+            except (ValueError, IndexError):
+                pass
+
+        # End time
+        if 'End Time:' in ln and 'seconds' in ln.lower() and current_file and current_start is not None:
+            try:
+                end = int(ln.split('seconds')[0].split(':')[-1].strip())
+                if current_file not in seizures_by_file:
+                    seizures_by_file[current_file] = []
+                seizures_by_file[current_file].append((current_start, end))
+                current_start = None
+            except (ValueError, IndexError):
+                pass
 
     return sampling_rate, channels_order, seizures_by_file, channels_by_index
 
