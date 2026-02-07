@@ -24,9 +24,18 @@ OUTPUT_MODEL_DIR = Path("../output_data/trained_models")
 OUTPUT_LOG_DIR = Path("../output_data/train_logs")
 
 EPOCHS = 10
-BATCH_SIZE = 8
+BATCH_SIZE = 8  # Increase to 16 or 32 if you have enough GPU memory
 LR = 1e-3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# GPU optimization settings
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True  # Auto-tune cuDNN algorithms for better performance
+    torch.cuda.empty_cache()  # Clear GPU cache before training
+    print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
+    print(f"   GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+else:
+    print("⚠️  Running on CPU (CUDA not available)")
 
 # Base resonator frequencies
 full_resonator_array = torch.tensor([
@@ -139,10 +148,15 @@ def load_dataset(path):
 # ==========================================================
 # 4. Training loop
 # ==========================================================
-def train_model(model, X, y):
+def train_model(model, X, y, use_amp=True):
     model.to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=LR)
+
+    # Mixed precision training for faster GPU training
+    scaler = torch.cuda.amp.GradScaler() if (use_amp and torch.cuda.is_available()) else None
+    if scaler:
+        print("✓ Using Automatic Mixed Precision (AMP) for faster training")
 
     dataset = torch.utils.data.TensorDataset(
         torch.tensor(X, dtype=torch.float32),
@@ -158,10 +172,20 @@ def train_model(model, X, y):
             batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
 
             optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
+
+            # Mixed precision training
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    outputs = model(batch_X)
+                    loss = criterion(outputs, batch_y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(batch_X)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
 
             total_loss += loss.item() * batch_X.size(0)
             preds = outputs.argmax(dim=1)

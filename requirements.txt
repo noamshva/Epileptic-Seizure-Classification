@@ -1,8 +1,11 @@
 sctn
-torch
+torch  # Install with CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu124
 numpy
 scipy
 matplotlib
 mne
 tqdm
 seaborn
+pandas
+scikit-learn
+bindsnet

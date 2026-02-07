@@ -48,7 +48,15 @@ OUT_DIR = Path("../output_data/results")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 16
+BATCH_SIZE = 16  # Increase to 32 or 64 if you have enough GPU memory
+
+# GPU optimization settings
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.cuda.empty_cache()
+    print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
+else:
+    print("⚠️  Running on CPU (CUDA not available)")
 
 # ------------------------------------------------------------
 # Model definition (same as used in training)

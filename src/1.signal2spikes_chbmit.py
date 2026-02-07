@@ -51,36 +51,24 @@ clk_resonators = {
 SUBJECTS = ["chb01"]              # [] → process all subjects in CHBMIT_ROOT
 EDF_WHITELIST = ["chb01_03.edf"]  # [] → include all EDF files under each subject
 
-# ======== SECOND-LEVEL LABELING ========
-# Define exact second ranges for processing (more precise than minute-level)
-# For chb01_03.edf: Seizure is 2996-3036 seconds (40 seconds)
+# ======== MINUTE-LEVEL PROCESSING (SA approach) ========
+# SA paper uses 60-second (1 minute) windows for resonator processing.
+# This allows proper frequency characterization (Delta needs multiple cycles).
+#
+# We use the exact seizure times from the summary file (e.g., 2996-3036 seconds)
+# and determine which 60-second windows to process based on those times.
+#
+# Processing range: How many minutes before/after seizure to include
+MINUTES_BEFORE_SEIZURE = 1  # Process 1 minute before seizure starts
+MINUTES_AFTER_SEIZURE = 1   # Process 1 minute after seizure ends
 
-# STAGE 1: Quick validation (~15-20 min)
-PROCESS_SECOND_RANGES = [
-    (2996-20, 3036+20),  # 20s before, seizure (40s), 20s after = 80 seconds total
-]
-
-# ======== MONOPOLAR CHANNEL SELECTION ========
-# Select important bipolar pairs (from feature analysis), then extract monopolar electrodes
-# These will be average-referenced to create proper monopolar recordings
-IMPORTANT_BIPOLAR_PAIRS = [
+# ======== BIPOLAR CHANNEL SELECTION ========
+# Use bipolar channels directly from the EDF file (no reconstruction needed)
+# These are the important bipolar pairs identified from feature analysis
+SELECT_BIPOLAR_CHANNELS = [
     "FT9-FT10", "P8-O2", "T7-P7", "CZ-PZ", "T8-P8",
     "P3-O1", "P7-O1", "FP1-F7", "F7-T7", "C4-P4"
 ]
-
-# Automatically extract unique monopolar electrodes from the bipolar pairs
-def extract_monopolar_electrodes(bipolar_pairs):
-    """Extract unique electrode names from bipolar channel pairs."""
-    electrodes = set()
-    for pair in bipolar_pairs:
-        parts = pair.split("-")
-        if len(parts) == 2:
-            electrodes.add(parts[0])
-            electrodes.add(parts[1])
-    return sorted(electrodes)
-
-SELECT_MONOPOLAR_ELECTRODES = extract_monopolar_electrodes(IMPORTANT_BIPOLAR_PAIRS)
-# Results in: ['C4', 'CZ', 'F7', 'FP1', 'FT10', 'FT9', 'O1', 'O2', 'P3', 'P4', 'P7', 'P8', 'PZ', 'T7', 'T8']
 
 
 # ============================================================
@@ -137,39 +125,37 @@ def save_output(resonator, spikes_output_path, clk_freq: int):
     np.savez_compressed(file=spikes_output_path, spikes=sp)
 
 
-# --- worker that processes ONE (clk_freq, f0) over all minutes for a single channel ---
+# --- worker that processes ONE (clk_freq, f0) over all MINUTES for a single channel ---
 def _run_one_resonator(args):
     (subject, edf_file, ch_name, clk_freq, f0,
-     seconds_by_label, resampled_by_second, spikes_root) = args
+     resampled_by_minute, spikes_root) = args
 
     start_t = time.time()
     edf_base = Path(edf_file).stem
     resonator = spikes_resonator(freq0=f0, clk_freq=clk_freq)
 
-    # warmup
+    # Warmup with 5 seconds of zeros (SA approach)
     resonator.log_out_spikes(-1)
     out_neuron = resonator.layers_neurons[-1].neurons[-1]
     resonator.input_full_data(np.zeros(clk_freq * 5))
     out_neuron.forget_logs()
 
     wrote = 0
-    for label, second_list in seconds_by_label.items():
-        for (sec_start, sec_end) in second_list:
-            rs = resampled_by_second.get(sec_start)
-            if rs is None or rs.size == 0:
-                continue
+    for (label, minute), rs in resampled_by_minute.items():
+        if rs is None or rs.size == 0:
+            continue
 
-            # Store by second instead of minute
-            out_path = Path(spikes_root) / f"{subject}/{edf_base}" / label / str(sec_start) / ch_name / str(clk_freq) / f"{f0}.npz"
+        # Store by MINUTE (SA approach: 60-second windows)
+        out_path = Path(spikes_root) / f"{subject}/{edf_base}" / label / str(minute) / ch_name / str(clk_freq) / f"{f0}.npz"
 
-            if not out_path.exists():
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                resonator.input_full_data(rs)
-                # Output spikes for 1 second (not 60 seconds)
-                sp = out_neuron.out_spikes(False, clk_freq * 1).astype(np.int8)
-                np.savez_compressed(out_path, spikes=sp)
-                out_neuron.forget_logs()
-                wrote += 1
+        if not out_path.exists():
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            resonator.input_full_data(rs)
+            # Output spikes for full 60 seconds (SA approach)
+            sp = out_neuron.out_spikes(False, clk_freq * 60).astype(np.int8)
+            np.savez_compressed(out_path, spikes=sp)
+            out_neuron.forget_logs()
+            wrote += 1
 
     dur = time.time() - start_t
     return (clk_freq, f0, ch_name, wrote, dur)
@@ -246,151 +232,140 @@ def parse_summary(summary_path: str):
     return sampling_rate, channels_order, seizures_by_file, channels_by_index
 
 
-def read_edf_channels_monopolar(edf_path: str, desired_monopolar_electrodes: list[str]) -> pd.DataFrame:
+def read_edf_channels_bipolar(edf_path: str, desired_bipolar_channels: list[str]) -> pd.DataFrame:
     """
-    Read EDF file and create average-referenced monopolar channels.
+    Read EDF file and extract bipolar channels directly.
+
+    This is the simple, direct approach - no reconstruction needed.
+    Bipolar montage is actually preferred for seizure detection because it:
+    - Localizes activity to specific brain regions
+    - Reduces common-mode noise and artifacts
+    - Preserves seizure-specific signal characteristics
 
     Args:
         edf_path: Path to EDF file
-        desired_monopolar_electrodes: List of individual electrode names (e.g., ['P7', 'O1', 'FP1'])
+        desired_bipolar_channels: List of bipolar channel names (e.g., ['FP1-F7', 'T7-P7'])
 
     Returns:
-        DataFrame with average-referenced monopolar channels
+        DataFrame with bipolar channel data, normalized to [-1, 1]
     """
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose="ERROR")
 
-    # Map electrode names to available channels (case-insensitive)
-    # The CHB-MIT dataset has bipolar channels, so we need to extract individual electrodes
-    all_bipolar_channels = [ch.strip() for ch in raw.ch_names]
+    # Get available channels from the EDF file
+    available_channels = [ch.strip() for ch in raw.ch_names]
 
-    # Build a mapping of which bipolar channels contain each monopolar electrode
-    electrode_to_bipolar = {}
-    for electrode in desired_monopolar_electrodes:
-        electrode_to_bipolar[electrode] = []
-        for ch_name in all_bipolar_channels:
-            # Match electrode in bipolar pair (e.g., "P7" in "P7-O1" or "FP1-P7")
-            parts = ch_name.split("-")
-            if len(parts) == 2:
-                if parts[0].upper() == electrode.upper() or parts[1].upper() == electrode.upper():
-                    electrode_to_bipolar[electrode].append(ch_name)
+    # Match desired channels to available channels (case-insensitive, flexible matching)
+    matched_channels = []
+    channel_mapping = {}  # Maps actual name in file to desired name
 
-    # Get all unique bipolar channels needed
-    needed_bipolar = set()
-    for channels in electrode_to_bipolar.values():
-        needed_bipolar.update(channels)
-    needed_bipolar = sorted(needed_bipolar)
+    for desired in desired_bipolar_channels:
+        # Normalize: uppercase, remove spaces, remove trailing numbers/suffixes
+        desired_normalized = desired.upper().replace(" ", "").strip()
+        found = False
+        for avail in available_channels:
+            # Normalize available channel name similarly
+            avail_normalized = avail.upper().replace(" ", "").strip()
+            # Check exact match first
+            if desired_normalized == avail_normalized:
+                matched_channels.append(avail)
+                channel_mapping[avail] = desired
+                found = True
+                break
+            # Check if available channel starts with desired (handles "T8-P8-0" matching "T8-P8")
+            if avail_normalized.startswith(desired_normalized):
+                matched_channels.append(avail)
+                channel_mapping[avail] = desired
+                found = True
+                break
+            # Check if desired is contained in available (handles variations)
+            if desired_normalized in avail_normalized or avail_normalized in desired_normalized:
+                matched_channels.append(avail)
+                channel_mapping[avail] = desired
+                found = True
+                break
+        if not found:
+            print(f"  Warning: Channel '{desired}' not found in EDF file.")
+            print(f"           Available channels: {available_channels[:5]}...")
 
-    if len(needed_bipolar) == 0:
-        raise ValueError(f"No bipolar channels found containing desired electrodes in {edf_path}")
+    if len(matched_channels) == 0:
+        raise ValueError(f"No matching bipolar channels found in {edf_path}. "
+                        f"Available: {available_channels[:10]}...")
 
-    # Read all needed bipolar channels
-    bipolar_data = raw.get_data(picks=needed_bipolar).T  # (n_samples, n_bipolar_ch)
-    bipolar_data = bp_filter(bipolar_data, 0.5, 62.0, fs)
+    print(f"  Matched {len(matched_channels)}/{len(desired_bipolar_channels)} channels")
 
-    # Reconstruct monopolar electrode signals from bipolar pairs
-    # For a bipolar channel A-B, we have: V(A-B) = V(A) - V(B)
-    # We'll use a least-squares approach to estimate monopolar voltages
-    n_samples = bipolar_data.shape[0]
-    all_electrodes_in_bipolar = set()
-    for ch in needed_bipolar:
-        parts = ch.split("-")
-        if len(parts) == 2:
-            all_electrodes_in_bipolar.add(parts[0].upper())
-            all_electrodes_in_bipolar.add(parts[1].upper())
+    # Read the matched bipolar channels directly
+    data = raw.get_data(picks=matched_channels).T  # (n_samples, n_channels)
 
-    all_electrodes_in_bipolar = sorted(all_electrodes_in_bipolar)
-    n_electrodes = len(all_electrodes_in_bipolar)
-    electrode_idx = {e: i for i, e in enumerate(all_electrodes_in_bipolar)}
+    # Apply band-pass filter (0.5-62 Hz, same as SA code)
+    data = bp_filter(data, 0.5, 62.0, fs)
 
-    # Build system of equations: bipolar = electrode1 - electrode2
-    # A * x = b, where x are monopolar voltages
-    A = np.zeros((len(needed_bipolar), n_electrodes))
-    for i, ch in enumerate(needed_bipolar):
-        parts = ch.split("-")
-        if len(parts) == 2:
-            e1, e2 = parts[0].upper(), parts[1].upper()
-            if e1 in electrode_idx and e2 in electrode_idx:
-                A[i, electrode_idx[e1]] = 1
-                A[i, electrode_idx[e2]] = -1
+    # NOTE: Do NOT normalize globally here!
+    # Normalization will be done per-second in process_file() to preserve
+    # amplitude differences between seizure and non-seizure segments.
+    # Global normalization erases these differences and causes identical spike rates.
 
-    # Solve for monopolar voltages at each time point using least squares
-    # Add constraint that average voltage = 0 (average reference)
-    A_with_avg = np.vstack([A, np.ones((1, n_electrodes))])  # Add average constraint
+    # Use the original desired channel names for consistency
+    column_names = [channel_mapping[ch] for ch in matched_channels]
 
-    monopolar_signals = np.zeros((n_samples, n_electrodes))
-    for t in range(n_samples):
-        b = bipolar_data[t, :]
-        b_with_avg = np.append(b, 0)  # Average should be 0
-        x, _, _, _ = np.linalg.lstsq(A_with_avg, b_with_avg, rcond=None)
-        monopolar_signals[t, :] = x
-
-    # Extract only the desired monopolar electrodes
-    keep_electrodes = []
-    keep_indices = []
-    for electrode in desired_monopolar_electrodes:
-        if electrode.upper() in electrode_idx:
-            keep_electrodes.append(electrode)
-            keep_indices.append(electrode_idx[electrode.upper()])
-
-    if len(keep_electrodes) == 0:
-        raise ValueError(f"None of the desired electrodes could be reconstructed from {edf_path}")
-
-    data = monopolar_signals[:, keep_indices]
-
-    # Normalize each channel
-    peak = np.max(np.abs(data), axis=0)
-    peak[peak == 0] = 1.0
-    data = data / peak
-
-    return pd.DataFrame(data, columns=keep_electrodes)
+    return pd.DataFrame(data, columns=column_names)
 
 
-def get_second_ranges_with_labels(n_samples: int, fs_: int, seizure_intervals_sec,
-                                   process_ranges: list[tuple[int, int]]):
+def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec):
     """
-    Create second-level ranges with seizure/non-seizure labels.
+    Get minute-level labeling based on seizure intervals from summary file.
+
+    Uses the SA paper approach: process full 60-second windows.
+    A minute is labeled 'seizure' if it contains ANY seizure activity.
 
     Args:
         n_samples: Total samples in EDF
         fs_: Sampling rate
         seizure_intervals_sec: List of (start, end) seizure intervals from summary
-        process_ranges: List of (start, end) second ranges to process
+                               e.g., [(2996, 3036)] means seizure from second 2996 to 3036
 
     Returns:
-        Dict with 'seizure' and 'non_seizure' lists of (start_sec, end_sec) tuples
+        Dict with 'seizure' and 'non_seizure' lists of minute indices
     """
-    max_seconds = n_samples // fs_
+    max_minutes = n_samples // (fs_ * 60)
 
-    seizure_ranges = []
-    non_seizure_ranges = []
+    # Determine which minutes contain seizure activity based on intervals from summary
+    seizure_minutes = set()
+    for (seiz_start, seiz_end) in seizure_intervals_sec:
+        # Find which minutes contain this seizure
+        # seiz_start and seiz_end are in SECONDS from the summary file
+        start_minute = seiz_start // 60
+        end_minute = (seiz_end - 1) // 60 + 1  # Inclusive end
+        for m in range(start_minute, min(end_minute, max_minutes)):
+            seizure_minutes.add(m)
 
-    for (range_start, range_end) in process_ranges:
-        # Clip to available data
-        range_start = max(0, range_start)
-        range_end = min(range_end, max_seconds)
+    # Determine non-seizure minutes: minutes before/after the seizure minutes
+    non_seizure_minutes = set()
+    if seizure_minutes:
+        min_seiz_minute = min(seizure_minutes)
+        max_seiz_minute = max(seizure_minutes)
 
-        if range_start >= range_end:
-            continue
+        # Add minutes BEFORE the first seizure minute
+        for m in range(max(0, min_seiz_minute - MINUTES_BEFORE_SEIZURE), min_seiz_minute):
+            if m not in seizure_minutes and m < max_minutes:
+                non_seizure_minutes.add(m)
 
-        # Check each second in this range
-        for sec in range(range_start, range_end):
-            # Check if this second overlaps with any seizure interval
-            is_seizure = False
-            for (seiz_start, seiz_end) in seizure_intervals_sec:
-                # A second is labeled seizure if it has ANY overlap with seizure interval
-                if sec < seiz_end and (sec + 1) > seiz_start:
-                    is_seizure = True
-                    break
+        # Add minutes AFTER the last seizure minute
+        for m in range(max_seiz_minute + 1, min(max_seiz_minute + 1 + MINUTES_AFTER_SEIZURE, max_minutes)):
+            if m not in seizure_minutes:
+                non_seizure_minutes.add(m)
 
-            if is_seizure:
-                seizure_ranges.append((sec, sec + 1))
-            else:
-                non_seizure_ranges.append((sec, sec + 1))
-
-    return {
-        "seizure": seizure_ranges,
-        "non_seizure": non_seizure_ranges,
+    result = {
+        "seizure": sorted(list(seizure_minutes)),
+        "non_seizure": sorted(list(non_seizure_minutes)),
     }
+
+    # Print info about seizure intervals (in seconds) and resulting minutes
+    if seizure_intervals_sec:
+        print(f"  Seizure intervals (seconds): {seizure_intervals_sec}")
+    print(f"  Seizure minutes: {result['seizure']}")
+    print(f"  Non-seizure minutes: {result['non_seizure']}")
+
+    return result
 
 # ============================================================
 #                SPIKE GENERATION PIPELINE
@@ -401,50 +376,61 @@ def resonator_fname_to_freq(name: str) -> float:
 
 def process_file(subject: str,
                  edf_file: str,
-                 desired_monopolar_electrodes: list[str],
+                 desired_bipolar_channels: list[str],
                  seizures_by_file: dict[str, list[tuple[int,int]]],
                  log_every:int = 5):
-
     """
-    Generate spikes per second, per monopolar channel, per resonator for a single EDF file.
-    Now works with second-level precision instead of minute-level.
-    Parallelizes across f0 for each (channel, clk_freq).
+    Generate spikes per MINUTE, per bipolar channel, per resonator for a single EDF file.
+
+    Uses the SA paper approach:
+    - Process full 60-second windows (not 1-second)
+    - Normalize per-minute segment to [-1, 1]
+    - Store spikes for entire minute continuously
     """
 
     edf_path = os.path.join(CHBMIT_ROOT, subject, edf_file)
-    df = read_edf_channels_monopolar(edf_path, desired_monopolar_electrodes)
+    df = read_edf_channels_bipolar(edf_path, desired_bipolar_channels)
     n_samples = df.shape[0]
 
     seizure_intervals = seizures_by_file.get(edf_file, [])
-    second_ranges = get_second_ranges_with_labels(n_samples, fs, seizure_intervals, PROCESS_SECOND_RANGES)
+    minute_labels = get_minutes_with_labels(n_samples, fs, seizure_intervals)
 
-    n_seiz = len(second_ranges.get("seizure", []))
-    n_non  = len(second_ranges.get("non_seizure", []))
-    print(f"\n>>> {subject}/{edf_file} | samples={n_samples:,} | seconds: seizure={n_seiz} non_seizure={n_non}")
+    n_seiz = len(minute_labels.get("seizure", []))
+    n_non = len(minute_labels.get("non_seizure", []))
+    print(f"\n>>> {subject}/{edf_file} | samples={n_samples:,} | minutes: seizure={n_seiz} non_seizure={n_non}")
 
     for ch in df.columns:
         ch_data = df[ch].values
         print(f"  [Channel] {ch}")
 
-        # OPTIMIZATION: Prepare resampled data for ALL clock frequencies first
+        # Prepare resampled data for ALL clock frequencies, per MINUTE
         resampled_by_clk = {}
         for clk_freq in clk_resonators.keys():
-            resampled_by_second = {}
-            for label, second_list in second_ranges.items():
-                for (sec_start, sec_end) in second_list:
-                    start_sample = fs * sec_start
-                    stop_sample = min(fs * sec_end, n_samples)
+            resampled_by_minute = {}
+            for label, minute_list in minute_labels.items():
+                for minute in minute_list:
+                    # Extract 60-second segment for this minute
+                    start_sample = fs * 60 * minute
+                    stop_sample = min(fs * 60 * (minute + 1), n_samples)
                     if stop_sample <= start_sample:
                         continue
                     seg = ch_data[start_sample:stop_sample]
+
+                    # SA NORMALIZATION: Normalize per-minute to [-1, 1]
+                    # This preserves relative frequency content within the minute
+                    seg_peak = np.max(np.abs(seg))
+                    if seg_peak > 0:
+                        seg = seg / seg_peak
+
+                    # Resample to clock frequency
                     rs = resample_signal(clk_freq, fs, seg)
                     if rs.size > 0:
-                        resampled_by_second[sec_start] = rs
+                        resampled_by_minute[(label, minute)] = rs
 
-            if len(resampled_by_second) > 0:
-                resampled_by_clk[clk_freq] = resampled_by_second
+            if len(resampled_by_minute) > 0:
+                resampled_by_clk[clk_freq] = resampled_by_minute
 
-        # OPTIMIZATION: Process ALL clock frequencies in parallel (not sequential)
+        # Process ALL clock frequencies in parallel
         maxw = max(1, (os.cpu_count() or 2) - 1)
 
         with ProcessPoolExecutor(max_workers=maxw) as ex:
@@ -454,11 +440,11 @@ def process_file(subject: str,
             # Submit ALL f0 resonators across ALL clock frequencies
             for clk_freq, resonators in clk_resonators.items():
                 if clk_freq not in resampled_by_clk:
-                    print(f"    clk={clk_freq:>6} Hz | no usable seconds after resample; skipping.")
+                    print(f"    clk={clk_freq:>6} Hz | no usable minutes after resample; skipping.")
                     continue
 
-                resampled_by_second = resampled_by_clk[clk_freq]
-                n_seconds = len(resampled_by_second)
+                resampled_by_minute = resampled_by_clk[clk_freq]
+                n_minutes = len(resampled_by_minute)
                 total_f0 = len(resonators)
 
                 clk_info[clk_freq] = {
@@ -468,13 +454,12 @@ def process_file(subject: str,
                     't0': time.time()
                 }
 
-                print(f"    clk={clk_freq:>6} Hz | seconds_resampled={n_seconds} | f0_count={total_f0}")
+                print(f"    clk={clk_freq:>6} Hz | minutes_resampled={n_minutes} | f0_count={total_f0}")
 
                 for f0 in resonators:
                     args = (
                         subject, edf_file, ch, clk_freq, f0,
-                        second_ranges,
-                        resampled_by_second,
+                        resampled_by_minute,
                         SPIKES_ROOT,
                     )
                     fut = ex.submit(_run_one_resonator, args)
@@ -504,17 +489,17 @@ def process_file(subject: str,
 
 def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_beginning_s=0):
     """
-    Build dataset windows from the generated per-second spikes.
+    Build dataset windows from the generated per-MINUTE spikes (SA approach).
 
-    Now works with second-level precision and labels each window individually
-    based on whether it overlaps with seizure intervals.
+    Now works with minute-level storage: each minute has 60 seconds of spike data.
+    Windows are extracted from the full 60-second spike arrays.
 
     Args:
         time_of_sample_s: Window size in seconds (e.g., 0.25)
         overlap: Overlap fraction (e.g., 0.5 for 50% overlap)
         subjects: List of subjects to process
         output_path: Output directory for windowed data
-        skip_beginning_s: Skip first N seconds of each second (usually 0 for second-level)
+        skip_beginning_s: Skip first N seconds of each minute (warmup)
     """
     spikes_root = SPIKES_ROOT
 
@@ -527,18 +512,18 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
                 continue
             for trial in os.listdir(subj_dir):
                 trial_dir = os.path.join(subj_dir, trial)
-                # find any second dir
+                # find any minute dir
                 for label in ["seizure", "non_seizure"]:
                     lab_dir = os.path.join(trial_dir, label)
                     if not os.path.isdir(lab_dir):
                         continue
-                    for second in os.listdir(lab_dir):
-                        second_dir = os.path.join(lab_dir, second)
-                        if not os.path.isdir(second_dir):
+                    for minute in os.listdir(lab_dir):
+                        minute_dir = os.path.join(lab_dir, minute)
+                        if not os.path.isdir(minute_dir):
                             continue
                         # find any channel dir
-                        for ch in os.listdir(second_dir):
-                            ch_dir = os.path.join(second_dir, ch)
+                        for ch in os.listdir(minute_dir):
+                            ch_dir = os.path.join(minute_dir, ch)
                             if not os.path.isdir(ch_dir):
                                 continue
                             clk_list = [int(x) for x in os.listdir(ch_dir) if x.isdigit()]
@@ -575,12 +560,12 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
             trial_label_dir = os.path.join(spikes_root, trial, label)
             if not os.path.isdir(trial_label_dir):
                 continue
-            for second in os.listdir(trial_label_dir):
-                second_dir = os.path.join(trial_label_dir, second)
-                if not os.path.isdir(second_dir):
+            for minute in os.listdir(trial_label_dir):
+                minute_dir = os.path.join(trial_label_dir, minute)
+                if not os.path.isdir(minute_dir):
                     continue
-                for ch in os.listdir(second_dir):
-                    ch_dir = os.path.join(second_dir, ch)
+                for ch in os.listdir(minute_dir):
+                    ch_dir = os.path.join(minute_dir, ch)
                     if not os.path.isdir(ch_dir):
                         continue
                     for clk in os.listdir(ch_dir):
@@ -596,15 +581,15 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
                 if not os.path.isdir(trial_label_dir):
                     continue
 
-                for second in os.listdir(trial_label_dir):
-                    second_i = int(second)
-                    second_dir = os.path.join(trial_label_dir, second)
-                    full_second_spikes_input = {}
+                for minute in os.listdir(trial_label_dir):
+                    minute_i = int(minute)
+                    minute_dir = os.path.join(trial_label_dir, minute)
+                    full_minute_spikes_input = {}
 
                     # build inputs by bands/channels; SKIP empty bands
                     for band_name, (lf, hf) in bands.items():
-                        for ch_name in os.listdir(second_dir):
-                            ch_dir = os.path.join(second_dir, ch_name)
+                        for ch_name in os.listdir(minute_dir):
+                            ch_dir = os.path.join(minute_dir, ch_name)
                             if not os.path.isdir(ch_dir):
                                 continue
 
@@ -630,7 +615,7 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
 
                                     arr = np.load(os.path.join(freq_dir, f0_str))["spikes"].astype(np.int8)
 
-                                    # drop warm-up (usually 0 for second-level)
+                                    # drop warm-up (skip_beginning_s seconds)
                                     cut = skip_beginning_s * clk_freq
                                     if cut >= arr.size:
                                         continue
@@ -640,16 +625,15 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
                                     if clk_freq != sample_fs:
                                         # integer stride required here (we only expect sample_fs to be multiple of clk_freq)
                                         stride = sample_fs // clk_freq
+                                        target_len = (60 - skip_beginning_s) * sample_fs
                                         if stride * clk_freq != sample_fs:
                                             # safety: fallback nearest-upsample with zeros at nearest indices
-                                            up_len = (1 - skip_beginning_s) * sample_fs
-                                            up = np.zeros(up_len, dtype=np.int8)
-                                            up_idx = np.arange(0, up_len, max(1, int(round(sample_fs/clk_freq))))[:arr.size]
+                                            up = np.zeros(target_len, dtype=np.int8)
+                                            up_idx = np.arange(0, target_len, max(1, int(round(sample_fs/clk_freq))))[:arr.size]
                                             up[up_idx] = arr[:up_idx.size]
                                             arr = up
                                         else:
-                                            up_len = (1 - skip_beginning_s) * sample_fs
-                                            up = np.zeros(up_len, dtype=np.int8)
+                                            up = np.zeros(target_len, dtype=np.int8)
                                             up[::stride] = arr[:up[::stride].shape[0]]
                                             arr = up
 
@@ -658,22 +642,23 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
 
                             # if no f0 ended up in this band for this channel, SKIP this input_name
                             if band_dict:
-                                full_second_spikes_input[f"{ch_name}-{band_name}"] = band_dict
+                                full_minute_spikes_input[f"{ch_name}-{band_name}"] = band_dict
 
-                    # If nothing to stack for this second, skip quietly
-                    if not full_second_spikes_input:
+                    # If nothing to stack for this minute, skip quietly
+                    if not full_minute_spikes_input:
                         continue
 
-                    # window over the second (consistent sample_fs)
-                    # Now with overlap support
+                    # Window over the full minute (60 seconds at sample_fs)
+                    # Extract windows with overlap support
+                    usable_samples = (60 - skip_beginning_s) * sample_fs
                     for sample_start_index in range(
-                        0,  # start from beginning of second
-                        sample_fs * (1 - skip_beginning_s) - spikes_in_sample + 1,
+                        0,  # start from beginning of minute (after warmup skip)
+                        usable_samples - spikes_in_sample + 1,
                         step,
                     ):
                         # build tensor per input_name; SKIP any input that has no arrays (safety check)
                         sample_spikes_input = {}
-                        for input_name, resonators_arrays in full_second_spikes_input.items():
+                        for input_name, resonators_arrays in full_minute_spikes_input.items():
                             if not resonators_arrays:
                                 continue
                             stacks = [
@@ -689,8 +674,11 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
                         if not sample_spikes_input:
                             continue
 
-                        # File name = absolute time in seconds (second + offset within second)
-                        file_name = f"{second_i + (sample_start_index / sample_fs)}"
+                        # File name = absolute time in seconds
+                        # minute_i * 60 gives the start of the minute in seconds
+                        # sample_start_index / sample_fs gives offset within minute
+                        absolute_time_s = minute_i * 60 + skip_beginning_s + (sample_start_index / sample_fs)
+                        file_name = f"{absolute_time_s:.3f}"
                         out_path = Path(output_path) / trial / label / f"{file_name}.npz"
                         out_path.parent.mkdir(parents=True, exist_ok=True)
                         if not out_path.is_file():
@@ -716,12 +704,12 @@ def main():
         if sampling_rate != fs:
             print(f"Warning: summary says fs={sampling_rate} but using fs={fs}")
 
-        # Use monopolar electrodes instead of bipolar channel indexes
-        desired_monopolar_electrodes = SELECT_MONOPOLAR_ELECTRODES
-        if not desired_monopolar_electrodes:
-            raise ValueError("No monopolar electrodes selected. Please set SELECT_MONOPOLAR_ELECTRODES.")
+        # Use bipolar channels directly (no reconstruction needed)
+        desired_bipolar_channels = SELECT_BIPOLAR_CHANNELS
+        if not desired_bipolar_channels:
+            raise ValueError("No bipolar channels selected. Please set SELECT_BIPOLAR_CHANNELS.")
 
-        print(f"Selected monopolar electrodes: {desired_monopolar_electrodes}")
+        print(f"Selected bipolar channels: {desired_bipolar_channels}")
 
         edf_files = sorted([f for f in os.listdir(subj_dir) if f.lower().endswith(".edf")])
         if EDF_WHITELIST:
@@ -730,10 +718,10 @@ def main():
             print(f"No EDF files for {subject}, skipping.")
             continue
 
-        total = len(edf_files) * (len(desired_monopolar_electrodes) or 1) * sum(len(v) for v in clk_resonators.values())
+        total = len(edf_files) * len(desired_bipolar_channels) * sum(len(v) for v in clk_resonators.values())
         with tqdm(total=total, desc=f"Subject {subject} (spikes)") as pbar:
             for edf_file in edf_files:
-                process_file(subject, edf_file, desired_monopolar_electrodes, seizures_by_file)
+                process_file(subject, edf_file, desired_bipolar_channels, seizures_by_file)
                 pbar.update(1)
 
     create_datasets(

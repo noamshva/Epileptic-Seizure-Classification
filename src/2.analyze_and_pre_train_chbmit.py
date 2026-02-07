@@ -46,7 +46,7 @@ _project_root = _script_dir.parent
 DATA_ROOT = _project_root / "dataset" / "spikes_windowed"
 RAW_SPIKES_ROOT = _project_root / "dataset" / "spikes_raw"
 RAW_EDF_PATH = _project_root / "dataset" / "chbmit" / "chb01" / "chb01_03.edf"
-OUTPUT_DIR = _project_root / "analysis" / "monopolar_validation"
+OUTPUT_DIR = _project_root / "analysis" / "bipolar_validation"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
@@ -85,9 +85,11 @@ BANDS_WITH_COVERAGE = {
     'Gamma': False,  # 32-62 Hz -> NO resonators at all!
 }
 
-# Monopolar electrodes
-MONOPOLAR_ELECTRODES = ['C4', 'CZ', 'F7', 'FP1', 'FT10', 'FT9', 'O1', 'O2',
-                        'P3', 'P4', 'P7', 'P8', 'PZ', 'T7', 'T8']
+# Bipolar channels (must match 1.signal2spikes_chbmit.py)
+BIPOLAR_CHANNELS = [
+    "FT9-FT10", "P8-O2", "T7-P7", "CZ-PZ", "T8-P8",
+    "P3-O1", "P7-O1", "FP1-F7", "F7-T7", "C4-P4"
+]
 
 # Spike density parameters (from time_frequency_analasys notebook)
 SPIKE_DENSITY_WINDOW = 500  # Convolution window size
@@ -96,9 +98,13 @@ SPARSE_STEPS = 10  # Downsampling factor
 # Visualization
 FIG_DPI = 150
 
-# Time ranges for CHB-MIT chb01_03
+# Time ranges for CHB-MIT chb01_03 (in seconds)
 SEIZURE_SECOND_RANGE = (2996, 3036)
 NON_SEIZURE_SECOND_RANGES = [(2940, 2995), (3037, 3120)]
+
+# Corresponding minute indices (seizure seconds 2996-3036 = minutes 49-50)
+SEIZURE_MINUTE_RANGE = (49, 51)  # Seizure spans minutes 49 and 50
+NON_SEIZURE_MINUTE_INDICES = [48, 51]  # Minutes before and after seizure
 
 # ============================================================
 # Topography Map Configuration (from SA notebook)
@@ -757,8 +763,9 @@ def diagnose_spike_data(samples: List[Dict], label: str):
 
     for sample in samples[:5]:  # Check first 5 samples
         for key, spikes in sample.items():
-            parts = key.split("-")
-            band = parts[-1] if len(parts) > 1 else "Unknown"
+            # Parse band from key (format: "bipolar_pair-band", e.g., "FT9-FT10-Delta")
+            parts = key.rsplit("-", 1)  # Split from right, max 1 split
+            band = parts[-1] if len(parts) == 2 else "Unknown"
 
             if band not in band_stats:
                 continue
@@ -856,8 +863,11 @@ def compute_power_by_band(samples: List[Dict]) -> Dict[str, List[float]]:
 
     for sample in samples:
         for key, spikes in sample.items():
-            # Parse band from key (format: "electrode-band")
-            parts = key.split("-")
+            # Parse band from key (format: "bipolar_pair-band", e.g., "FT9-FT10-Delta")
+            # The band is always the last part after the final hyphen
+            parts = key.rsplit("-", 1)  # Split from right, max 1 split
+            if len(parts) != 2:
+                continue
             band = parts[-1]
 
             if band not in power_on_band:
@@ -883,13 +893,16 @@ def compute_power_by_band(samples: List[Dict]) -> Dict[str, List[float]]:
 
 def compute_power_by_channel(samples: List[Dict]) -> Dict[str, List[float]]:
     """Compute power (std) for each channel from windowed samples."""
-    power_on_channel = {ch: [] for ch in MONOPOLAR_ELECTRODES}
+    power_on_channel = {ch: [] for ch in BIPOLAR_CHANNELS}
 
     for sample in samples:
         for key, spikes in sample.items():
-            # Parse channel from key (format: "electrode-band")
-            parts = key.split("-")
-            channel = parts[0]
+            # Parse channel from key (format: "bipolar_pair-band", e.g., "FT9-FT10-Delta")
+            # The band is always the last part after the final hyphen
+            parts = key.rsplit("-", 1)  # Split from right, max 1 split
+            if len(parts) != 2:
+                continue
+            channel = parts[0]  # e.g., "FT9-FT10"
 
             if channel not in power_on_channel:
                 continue
@@ -935,10 +948,15 @@ def plot_fft_vs_spikegram_comparison(eeg_data: np.ndarray, spike_sample: Dict,
     ax_spike = axes[1]
 
     # Collect spikes for this channel
+    # For bipolar channels, key format is "bipolar_pair-band", e.g., "FT9-FT10-Delta"
     channel_spikes = {}
     for key, spikes in spike_sample.items():
-        if key.startswith(channel + "-"):
-            band = key.split("-")[-1]
+        # Parse channel and band using rsplit to handle bipolar pairs with hyphens
+        parts = key.rsplit("-", 1)
+        if len(parts) != 2:
+            continue
+        ch, band = parts
+        if ch == channel:
             spikes_np = spikes.numpy() if isinstance(spikes, torch.Tensor) else spikes
             # Average across resonators
             channel_spikes[band] = spikes_np.mean(axis=0)
@@ -1140,17 +1158,81 @@ def plot_power_comparison(seizure_power: Dict[str, List[float]],
         plt.show()
 
 
+def plot_power_comparison_by_channel(seizure_power: Dict[str, List[float]],
+                                      non_seizure_power: Dict[str, List[float]],
+                                      output_path: Path = None):
+    """Plot power (std) comparison by bipolar channel."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Use bipolar channels
+    channel_names = BIPOLAR_CHANNELS
+    x = np.arange(len(channel_names))
+    width = 0.35
+
+    # Left: Bar comparison
+    ax1 = axes[0]
+    seiz_means = [np.mean(seizure_power.get(ch, [0])) for ch in channel_names]
+    seiz_stds = [np.std(seizure_power.get(ch, [0])) for ch in channel_names]
+    non_seiz_means = [np.mean(non_seizure_power.get(ch, [0])) for ch in channel_names]
+    non_seiz_stds = [np.std(non_seizure_power.get(ch, [0])) for ch in channel_names]
+
+    ax1.bar(x - width/2, seiz_means, width, yerr=seiz_stds,
+            label='Seizure', color='#d24b4b', alpha=0.8, capsize=3)
+    ax1.bar(x + width/2, non_seiz_means, width, yerr=non_seiz_stds,
+            label='Non-Seizure', color='#4b8fd2', alpha=0.8, capsize=3)
+
+    ax1.set_xlabel('Bipolar Channel')
+    ax1.set_ylabel('Power (std)')
+    ax1.set_title('Power by Bipolar Channel')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(channel_names, rotation=45, ha='right')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    # Right: Ratio
+    ax2 = axes[1]
+    ratios = []
+    for i in range(len(channel_names)):
+        if non_seiz_means[i] > 0:
+            ratios.append(seiz_means[i] / non_seiz_means[i])
+        else:
+            ratios.append(1.0)
+
+    colors = ['#2ca02c' if r > 1.1 else '#d62728' if r < 0.9 else '#1f77b4' for r in ratios]
+    ax2.bar(x, ratios, color=colors, alpha=0.8)
+    ax2.axhline(y=1.0, color='black', linestyle='--', linewidth=1)
+    ax2.set_xlabel('Bipolar Channel')
+    ax2.set_ylabel('Seizure / Non-Seizure Ratio')
+    ax2.set_title('Power Ratio by Bipolar Channel')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(channel_names, rotation=45, ha='right')
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    for i, r in enumerate(ratios):
+        ax2.annotate(f'{r:.2f}x', (i, r), ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+
+    if output_path:
+        plt.savefig(output_path, dpi=FIG_DPI)
+        plt.close()
+        print(f"  Saved: {output_path.name}")
+    else:
+        plt.show()
+
+
 # ============================================================
 # Main Analysis
 # ============================================================
 
 def main():
     print("=" * 70)
-    print("CHBMIT SPIKE ANALYSIS")
+    print("CHBMIT SPIKE ANALYSIS (BIPOLAR CHANNELS)")
     print("Methods from SCTN example notebooks")
     print("=" * 70)
     print(f"\nData directory: {DATA_ROOT}")
     print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Bipolar channels: {BIPOLAR_CHANNELS}")
     print()
 
     # Show frequency coverage information
@@ -1227,14 +1309,13 @@ def main():
         plot_spike_density_comparison(seizure_samples, non_seizure_samples,
                                        OUTPUT_DIR / "spike_density_comparison.png")
 
-    # 5. Plot topography maps
-    print("\n[5/7] Creating topography maps...")
-    if seizure_power_channel:
-        plot_topography_by_band(seizure_power_channel, "Seizure",
-                                OUTPUT_DIR / "topography_seizure.png")
-    if non_seizure_power_channel:
-        plot_topography_by_band(non_seizure_power_channel, "Non-Seizure",
-                                OUTPUT_DIR / "topography_non_seizure.png")
+    # 5. Plot power comparison by channel (replaces topography for bipolar)
+    print("\n[5/7] Creating power comparison by bipolar channel...")
+    # Note: Topography maps are skipped for bipolar channels since they don't map
+    # to single electrode positions. Instead, we plot power by channel directly.
+    if seizure_power_channel and non_seizure_power_channel:
+        plot_power_comparison_by_channel(seizure_power_channel, non_seizure_power_channel,
+                                          OUTPUT_DIR / "power_comparison_by_channel.png")
 
     # 6. FFT vs Spikegram comparison (if raw EEG available)
     print("\n[6/7] Creating FFT vs Spikegram comparison...")
@@ -1244,15 +1325,23 @@ def main():
         eeg_data = load_raw_eeg_segment(seizure_mid, duration_s=10.0)
 
         if eeg_data:
-            # Use first available channel
+            # Use first available bipolar channel from our list
             for ch_name, ch_data in eeg_data.items():
-                channel_base = ch_name.split("-")[0]
-                if channel_base in MONOPOLAR_ELECTRODES:
-                    plot_fft_vs_spikegram_comparison(
-                        ch_data, seizure_samples[0], channel_base, 10.0,
-                        OUTPUT_DIR / f"fft_vs_spikegram_{channel_base}.png"
-                    )
-                    break
+                # Normalize channel name for matching
+                ch_normalized = ch_name.upper().replace(" ", "").strip()
+                for bipolar_ch in BIPOLAR_CHANNELS:
+                    bipolar_normalized = bipolar_ch.upper().replace(" ", "").strip()
+                    if ch_normalized == bipolar_normalized or ch_normalized.startswith(bipolar_normalized):
+                        # Use a safe filename (replace - with _)
+                        safe_name = bipolar_ch.replace("-", "_")
+                        plot_fft_vs_spikegram_comparison(
+                            ch_data, seizure_samples[0], bipolar_ch, 10.0,
+                            OUTPUT_DIR / f"fft_vs_spikegram_{safe_name}.png"
+                        )
+                        break
+                else:
+                    continue  # No match found, try next channel
+                break  # Match found, exit outer loop
     else:
         print("  Skipping (raw EDF not found or no samples)")
 
@@ -1293,8 +1382,8 @@ def main():
     print(f"\nOutputs saved to: {OUTPUT_DIR}")
     print("\nGenerated files:")
     print("  - power_comparison_by_band.png")
+    print("  - power_comparison_by_channel.png")
     print("  - spike_density_comparison.png")
-    print("  - topography_seizure.png / topography_non_seizure.png")
     print("  - fft_vs_spikegram_*.png")
     print()
 
