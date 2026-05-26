@@ -181,7 +181,16 @@ BAND_RESONATORS = {
     "Alpha": [8.6, 10.5, 11.5, 12.8],
     "Beta":  [16.6, 19.4, 22.0, 24.8, 28.4, 30.5],
 }
-_SAMPLE_FS = 153_600        # SNN simulation tick rate (matches the resonator high clock)
+_SAMPLE_FS = 153_600        # encoded-spike rate (resonator high clock)
+
+# Temporal binning for the SNN. The encoded spike trains on disk stay at the
+# full 153.6 kHz rate; this is just how many of those ticks we collapse into a
+# single SNN simulation step. BIN_FACTOR=1 means no binning (paper fidelity).
+# Each output bin holds the SUM of spikes in that window (0..BIN_FACTOR per
+# resonator per bin). Larger BIN_FACTOR -> fewer SNN ticks per window ->
+# proportionally faster training, at the cost of timing precision finer than
+# BIN_FACTOR / _SAMPLE_FS seconds.
+BIN_FACTOR = int(os.environ.get("BIN_FACTOR", "1"))
 
 
 def _clk_of(f0: float) -> int:
@@ -266,8 +275,16 @@ def _build_window_inputs(win_desc, cache: _MinuteCache):
             stacks.append(slice_arr)
         if not stacks:
             continue
+        # [n_res, T_full] — sum-bin along the time axis if BIN_FACTOR > 1
+        stacked = np.stack(stacks)
+        if BIN_FACTOR > 1:
+            T_full = stacked.shape[1]
+            T_binned = T_full // BIN_FACTOR
+            # Trim to a multiple of BIN_FACTOR, then sum within each bin
+            stacked = stacked[:, : T_binned * BIN_FACTOR]
+            stacked = stacked.reshape(stacked.shape[0], T_binned, BIN_FACTOR).sum(axis=2)
         # [n_res, T] → [T, n_res], float32 for BindsNet
-        tensor = torch.from_numpy(np.stack(stacks)).T.contiguous().float()
+        tensor = torch.from_numpy(stacked).T.contiguous().float()
         inputs[f"{ch}-{band}-resonators"] = tensor
 
     label = 1 if win_desc["window_label"] == "seizure" else 0
@@ -366,6 +383,11 @@ SUBJECTS = ["chb01"]   # which subjects to read from dataset/spikes_raw/
 
 def main():
     print(f"Device = {DEVICE}")
+    sim_T = (int(_SAMPLE_FS * WINDOW_SECONDS)
+             // (BIN_FACTOR if BIN_FACTOR > 0 else 1))
+    print(f"Config: EPOCHS={EPOCHS}  BIN_FACTOR={BIN_FACTOR}  "
+          f"SNN ticks/window={sim_T:,}  "
+          f"(sample_fs={_SAMPLE_FS} Hz, window={WINDOW_SECONDS}s)")
     snn = build_snn()
     print(f"Built SNN: {len(snn.layers)} layers, {len(snn.connections)} connections, "
           f"output_neurons={snn.layers['output_layer'].n}")
