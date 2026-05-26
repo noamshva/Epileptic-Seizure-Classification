@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(dir ..datasetspikes_windowedchb01chb01_03 /s /b)",
-      "Bash(dir:*)"
-    ]
-  }
-}

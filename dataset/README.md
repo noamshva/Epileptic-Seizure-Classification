@@ -1,10 +1,24 @@
 # Dataset
 
-This folder contains all EEG data used in the project.
+EEG inputs and intermediate spike-encoded data. Heavy files are gitignored;
+the directory structure and these READMEs are kept.
 
-- **chbmit/** – Original CHB-MIT dataset (.edf files + summaries).
-- **spikes_raw/** – 1-minute spike trains generated from the raw EEG using signal2spikes.py.
-- **spikes_windowed/** – Final 0.25 s windows ready for training the SNN model.
+| Subfolder | Contents | Created by |
+|---|---|---|
+| `chbmit/` | Raw CHB-MIT EEG `.edf` files plus the per-subject `chbXX-summary.txt`. Download from <https://physionet.org/content/chbmit/1.0.0/>. | manual |
+| `spikes_raw/` | Per-resonator binary spike trains, organized as `<subject>/<edf_stem>/<seizure\|non_seizure>/<minute>/<channel>/<clk>/<f0>.npz`. One file per (channel, clock, resonator-frequency, minute). Compressed with `np.savez_compressed`. | `src/1.signal2spikes_chbmit.py` |
+
+There is no longer a `spikes_windowed/` directory — training and evaluation
+slice 2-second windows from `spikes_raw/` in memory.
 
 Data flow:
-chbmit → spikes_raw → spikes_windowed
+
+```
+chbmit/<subject>/<edf>.edf
+        │
+        ▼  (DSM encoding via SCTN resonators)
+spikes_raw/<subject>/<edf_stem>/<minute_label>/<minute>/<ch>/<clk>/<f0>.npz
+        │
+        ▼  (sliced on demand by src/3.run_train_chbmit.py)
+SNN training windows
+```
