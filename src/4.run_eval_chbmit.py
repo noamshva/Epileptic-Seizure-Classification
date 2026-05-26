@@ -84,13 +84,26 @@ def load_weights_into(snn, weights_path: Path):
 # ==========================================================
 # Inference
 # ==========================================================
-def predict(snn, subjects):
+def predict(snn, subjects, max_windows=None):
     """Lazy-load each window from `spikes_raw/`, run the SNN, return per-window
-    (true, pred, prob_of_seizure) arrays."""
+    (true, pred, prob_of_seizure) arrays.
+
+    max_windows caps the number of windows evaluated (smoke testing). When set,
+    windows are interleaved seizure/non-seizure so a small cap still covers both
+    classes.
+    """
     snn.train(mode=False)
     out_layer_name = "output_layer"
 
     windows = list(enumerate_windows(subjects, WINDOW_SECONDS, WINDOW_OVERLAP))
+    if max_windows is not None and max_windows < len(windows):
+        seiz = [w for w in windows if w["window_label"] == "seizure"]
+        non = [w for w in windows if w["window_label"] == "non_seizure"]
+        half = max_windows // 2
+        windows = seiz[:half] + non[: max_windows - half]
+        print(f"(eval capped to {len(windows)} windows: "
+              f"{sum(1 for w in windows if w['window_label']=='seizure')} seizure, "
+              f"{sum(1 for w in windows if w['window_label']=='non_seizure')} non-seizure)")
     cache = _MinuteCache(capacity=4)
 
     trues, preds, scores = [], [], []
@@ -191,6 +204,7 @@ def report_and_plot(trues, preds, scores):
 # Main
 # ==========================================================
 def main():
+    import os
     print(f"Device = {DEVICE}")
 
     if not MODEL_PATH.exists():
@@ -200,7 +214,8 @@ def main():
     snn.to(DEVICE)
     load_weights_into(snn, MODEL_PATH)
 
-    trues, preds, scores = predict(snn, SUBJECTS)
+    max_windows = int(os.environ["MAX_WINDOWS"]) if "MAX_WINDOWS" in os.environ else None
+    trues, preds, scores = predict(snn, SUBJECTS, max_windows=max_windows)
     report_and_plot(trues, preds, scores)
 
 
