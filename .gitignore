@@ -48,10 +48,15 @@ output_data/trained_models/*
 # Analysis outputs (keep structure + READMEs)
 # =========================================================
 analysis/figures/*
-analysis/pretrain_stats/*
+analysis/stats/*
 
 !analysis/figures/
-!analysis/pretrain_stats/
+!analysis/stats/
 !analysis/figures/README*
-!analysis/pretrain_stats/README*
+!analysis/stats/README*
+
+# =========================================================
+# Encoding / run logs in the project root
+# =========================================================
+encoding_*.log
 

@@ -1,3 +1,14 @@
+import sys
+
+# Force UTF-8 on stdout/stderr so we don't crash on the Hebrew-locale Windows
+# console (cp1255) when printing unusual characters.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 import re
 import torch
 import pickle
@@ -41,33 +52,56 @@ fs = 256  # Hz
 # Example: 2.88 Hz * 1_536_000 / 15_360 = 288 → uses f_288.json
 # Example: 10.5 Hz * 1_536_000 / 153_600 = 105 → uses f_105.json
 
-# Complete frequency coverage for final results (run overnight)
+# Full SA-paper frequency set across Delta/Theta/Alpha/Beta/Gamma.
+# This drives the ENCODING step only — every channel gets the full 35-resonator
+# bank on disk so any band can be re-enabled later without re-encoding.
+# The WINDOWING / TRAINING step filters bands via the `bands` dict in
+# create_datasets and BANDS in 3.run_train_chbmit.py (Gamma currently disabled).
+# Below 10 Hz → slow clock (15.36 kHz); 10 Hz and above → fast clock (153.6 kHz).
+# SCTN's resonator() auto-selects the closest pre-trained parameter file for each f0.
 clk_resonators = {
-    15360: [1.1, 1.3, 1.6, 1.9, 2.2, 2.5, 2.88, 3.05, 3.39, 3.7,
-            4.12, 4.62, 5.09, 5.45, 5.87, 6.36, 7.6],  # 17 frequencies (excluded 6.8, 8.6 due to large parameter errors)
-    153600: [10.5, 11.5, 12.8, 15.8],  # 4 frequencies: Alpha band
+    15360: [
+        # Delta (0.5-4 Hz): 10 resonators
+        1.1, 1.3, 1.6, 1.9, 2.2, 2.5, 2.88, 3.05, 3.39, 3.7,
+        # Theta (4-8 Hz): 8 resonators
+        4.12, 4.62, 5.09, 5.45, 5.87, 6.36, 6.8, 7.6,
+        # Alpha low: 8.6 Hz
+        8.6,
+    ],
+    153600: [
+        # Alpha high (10-14): 3 resonators
+        10.5, 11.5, 12.8,
+        # Beta (14-32): 6 resonators
+        16.6, 19.4, 22.0, 24.8, 28.4, 30.5,
+        # Gamma (32-62): 7 resonators
+        34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2,
+    ],
 }
 
 SUBJECTS = ["chb01"]              # [] → process all subjects in CHBMIT_ROOT
 EDF_WHITELIST = ["chb01_03.edf"]  # [] → include all EDF files under each subject
 
-# ======== MINUTE-LEVEL PROCESSING (SA approach) ========
-# SA paper uses 60-second (1 minute) windows for resonator processing.
-# This allows proper frequency characterization (Delta needs multiple cycles).
-#
-# We use the exact seizure times from the summary file (e.g., 2996-3036 seconds)
-# and determine which 60-second windows to process based on those times.
-#
-# Processing range: How many minutes before/after seizure to include
-MINUTES_BEFORE_SEIZURE = 1  # Process 1 minute before seizure starts
-MINUTES_AFTER_SEIZURE = 1   # Process 1 minute after seizure ends
+# ======== SEIZURE-AWARE MINUTE SELECTION ========
+# - Encode every minute that contains any seizure activity ("seizure" pool).
+# - Encode a subsampled set of minutes that are >= GUARD_SECONDS from every
+#   seizure boundary ("non_seizure" pool).
+# - Subsample non-seizure minutes to match the seizure-minute count per EDF.
+# Pre/post-ictal minutes (inside the guard band but not in a seizure) are excluded.
+GUARD_SECONDS = 5 * 60            # 5-minute guard band around each seizure
+SAMPLING_SEED = 42                # determinism for non-seizure subsampling
+
+# ======== WINDOWING ========
+# Shoeb 2010 convention: 2-second windows with 50% overlap (step = 1 s).
+# Labels are assigned per window based on overlap with seizure intervals.
+WINDOW_SECONDS = 2.0
+WINDOW_OVERLAP = 0.5
 
 # ======== BIPOLAR CHANNEL SELECTION ========
-# Use bipolar channels directly from the EDF file (no reconstruction needed)
-# These are the important bipolar pairs identified from feature analysis
+# 10-channel set used for verification on the sa-aligned branch.
 SELECT_BIPOLAR_CHANNELS = [
-    "FT9-FT10", "P8-O2", "T7-P7", "CZ-PZ", "T8-P8",
-    "P3-O1", "P7-O1", "FP1-F7", "F7-T7", "C4-P4"
+    "FT9-FT10", "T7-P7", "T8-P8", "P7-O1",
+    "F7-T7", "P8-O2", "CZ-PZ", "P3-O1",
+    "FP1-F7", "C4-P4",
 ]
 
 
@@ -317,60 +351,70 @@ def read_edf_channels_bipolar(edf_path: str, desired_bipolar_channels: list[str]
     return pd.DataFrame(data, columns=column_names)
 
 
-def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec):
+def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, rng=None):
     """
-    Get minute-level labeling based on seizure intervals from summary file.
+    Select which minutes to encode and label each as seizure / non_seizure.
 
-    Uses the SA paper approach: process full 60-second windows.
-    A minute is labeled 'seizure' if it contains ANY seizure activity.
+    Scheme (Shoeb 2010-style):
+      - "seizure"     : every minute overlapping any seizure interval.
+      - "non_seizure" : interictal minutes (>= GUARD_SECONDS from every seizure
+                        boundary), subsampled to match the seizure-minute count.
+      - Excluded     : minutes inside the guard band (pre/post-ictal).
 
     Args:
-        n_samples: Total samples in EDF
-        fs_: Sampling rate
-        seizure_intervals_sec: List of (start, end) seizure intervals from summary
-                               e.g., [(2996, 3036)] means seizure from second 2996 to 3036
+        n_samples: total samples in the EDF
+        fs_: EEG sampling rate (Hz)
+        seizure_intervals_sec: list of (start, end) seizure intervals, in seconds
+        rng: optional numpy Generator (for reproducible subsampling)
 
     Returns:
-        Dict with 'seizure' and 'non_seizure' lists of minute indices
+        Dict with 'seizure' and 'non_seizure' lists of minute indices.
     """
     max_minutes = n_samples // (fs_ * 60)
+    if rng is None:
+        rng = np.random.default_rng(SAMPLING_SEED)
 
-    # Determine which minutes contain seizure activity based on intervals from summary
-    seizure_minutes = set()
-    for (seiz_start, seiz_end) in seizure_intervals_sec:
-        # Find which minutes contain this seizure
-        # seiz_start and seiz_end are in SECONDS from the summary file
-        start_minute = seiz_start // 60
-        end_minute = (seiz_end - 1) // 60 + 1  # Inclusive end
-        for m in range(start_minute, min(end_minute, max_minutes)):
-            seizure_minutes.add(m)
+    seizure_minutes = []
+    interictal_minutes = []
+    for m in range(max_minutes):
+        m_start, m_end = m * 60, (m + 1) * 60
+        in_seizure = any(
+            (m_end > s) and (m_start < e) for (s, e) in seizure_intervals_sec
+        )
+        if in_seizure:
+            seizure_minutes.append(m)
+            continue
+        in_guard = any(
+            (m_end > s - GUARD_SECONDS) and (m_start < e + GUARD_SECONDS)
+            for (s, e) in seizure_intervals_sec
+        )
+        if in_guard:
+            continue  # pre/post-ictal — exclude entirely
+        interictal_minutes.append(m)
 
-    # Determine non-seizure minutes: minutes before/after the seizure minutes
-    non_seizure_minutes = set()
-    if seizure_minutes:
-        min_seiz_minute = min(seizure_minutes)
-        max_seiz_minute = max(seizure_minutes)
-
-        # Add minutes BEFORE the first seizure minute
-        for m in range(max(0, min_seiz_minute - MINUTES_BEFORE_SEIZURE), min_seiz_minute):
-            if m not in seizure_minutes and m < max_minutes:
-                non_seizure_minutes.add(m)
-
-        # Add minutes AFTER the last seizure minute
-        for m in range(max_seiz_minute + 1, min(max_seiz_minute + 1 + MINUTES_AFTER_SEIZURE, max_minutes)):
-            if m not in seizure_minutes:
-                non_seizure_minutes.add(m)
+    # Per-EDF class balance: subsample non-seizure minutes to match seizure count.
+    if seizure_minutes and interictal_minutes:
+        k = min(len(seizure_minutes), len(interictal_minutes))
+        chosen = rng.choice(interictal_minutes, size=k, replace=False).tolist()
+        chosen_non_seizure = sorted(int(m) for m in chosen)
+    elif not seizure_minutes:
+        # No seizure in this EDF: keep a small interictal sample for negative-only training
+        k = min(2, len(interictal_minutes))
+        chosen = rng.choice(interictal_minutes, size=k, replace=False).tolist() if k else []
+        chosen_non_seizure = sorted(int(m) for m in chosen)
+    else:
+        chosen_non_seizure = []
 
     result = {
-        "seizure": sorted(list(seizure_minutes)),
-        "non_seizure": sorted(list(non_seizure_minutes)),
+        "seizure": seizure_minutes,
+        "non_seizure": chosen_non_seizure,
     }
 
-    # Print info about seizure intervals (in seconds) and resulting minutes
     if seizure_intervals_sec:
         print(f"  Seizure intervals (seconds): {seizure_intervals_sec}")
-    print(f"  Seizure minutes: {result['seizure']}")
-    print(f"  Non-seizure minutes: {result['non_seizure']}")
+    print(f"  Seizure minutes ({len(result['seizure'])}): {result['seizure']}")
+    print(f"  Non-seizure minutes ({len(result['non_seizure'])}, "
+          f"sampled from {len(interictal_minutes)} interictal): {result['non_seizure']}")
 
     return result
 
@@ -490,25 +534,120 @@ def process_file(subject: str,
 
         # Print completion summary for all clock frequencies
         for clk_freq in clk_info:
-            print(f"    ✔ clk={clk_freq:>6} Hz done | wrote_files={clk_info[clk_freq]['wrote_total']}")
+            print(f"    [OK] clk={clk_freq:>6} Hz done | wrote_files={clk_info[clk_freq]['wrote_total']}")
         print()
+
+
+def _load_seizures_for_subjects(subjects):
+    """Re-parse each subject's summary to map edf_stem (e.g. 'chb01_03') -> [(start_s, end_s), ...].
+
+    Keys are normalized to the file stem (no .edf extension) to match the
+    directory naming used by `_run_one_resonator` and `create_datasets`.
+    """
+    seizures_by_edf = {}
+    for subj in subjects:
+        summary_path = os.path.join(CHBMIT_ROOT, subj, f"{subj}-summary.txt")
+        if not os.path.isfile(summary_path):
+            continue
+        _, _, seizures_by_file, _ = parse_summary(summary_path)
+        for edf_name, intervals in seizures_by_file.items():
+            seizures_by_edf[Path(edf_name).stem] = list(intervals)
+    return seizures_by_edf
+
+
+def _overlaps_any_seizure(start_s: float, end_s: float, intervals):
+    return any((end_s > s) and (start_s < e) for (s, e) in intervals)
+
+
+def enumerate_windows(
+    subjects,
+    time_of_sample_s: float = WINDOW_SECONDS,
+    overlap: float = WINDOW_OVERLAP,
+    skip_beginning_s: float = 0.0,
+    sample_fs: int = 153_600,
+):
+    """Yield one descriptor per training window without writing anything to disk.
+
+    Identical labelling logic to `create_datasets`, but returns metadata so the
+    training loop can lazy-load each window from `spikes_raw/` on demand.
+
+    Each yielded dict has:
+        subject, trial            — folder names under spikes_raw
+        minute_label              — "seizure" or "non_seizure" (the parent minute pool)
+        minute                    — int, minute index in the EDF
+        sec_offset_in_minute      — float seconds, start of the window within the minute
+        abs_start_s, abs_end_s    — absolute seconds in the EDF
+        window_label              — "seizure" or "non_seizure" (per-window relabel)
+    """
+    spikes_root = SPIKES_ROOT
+    seizures_by_edf = _load_seizures_for_subjects(subjects)
+
+    spikes_in_sample = int(sample_fs * time_of_sample_s)
+    step = int(spikes_in_sample * (1 - overlap))
+    usable_samples = int((60 - skip_beginning_s) * sample_fs)
+
+    for subj in subjects:
+        subj_dir = os.path.join(spikes_root, subj)
+        if not os.path.isdir(subj_dir):
+            continue
+        for trial in sorted(os.listdir(subj_dir)):
+            trial_dir = os.path.join(subj_dir, trial)
+            if not os.path.isdir(trial_dir):
+                continue
+            seizure_intervals = seizures_by_edf.get(Path(trial).stem, [])
+            for minute_label in ("seizure", "non_seizure"):
+                trial_label_dir = os.path.join(trial_dir, minute_label)
+                if not os.path.isdir(trial_label_dir):
+                    continue
+                for minute_str in sorted(os.listdir(trial_label_dir), key=int):
+                    minute = int(minute_str)
+                    for sample_start in range(
+                        0, usable_samples - spikes_in_sample + 1, step
+                    ):
+                        sec_offset = skip_beginning_s + sample_start / sample_fs
+                        abs_start = minute * 60 + sec_offset
+                        abs_end = abs_start + time_of_sample_s
+                        if _overlaps_any_seizure(abs_start, abs_end, seizure_intervals):
+                            window_label = "seizure"
+                        elif minute_label == "non_seizure":
+                            window_label = "non_seizure"
+                        else:
+                            continue
+                        yield {
+                            "subject": subj,
+                            "trial": trial,
+                            "minute_label": minute_label,
+                            "minute": minute,
+                            "sec_offset_in_minute": sec_offset,
+                            "abs_start_s": abs_start,
+                            "abs_end_s": abs_end,
+                            "window_label": window_label,
+                        }
 
 
 def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_beginning_s=0):
     """
-    Build dataset windows from the generated per-MINUTE spikes (SA approach).
+    Build classifier-ready windows from per-minute spike trains.
 
-    Now works with minute-level storage: each minute has 60 seconds of spike data.
-    Windows are extracted from the full 60-second spike arrays.
+    For each fixed-length window:
+      - "seizure"     if the window's absolute time range overlaps any seizure
+                      interval in the EDF.
+      - "non_seizure" if the window lives inside a minute that was put in the
+                      `non_seizure` pool by `get_minutes_with_labels` (i.e.
+                      interictal, >= GUARD_SECONDS from any seizure).
+      - otherwise the window is **discarded** (e.g. the non-seizure part of a
+        minute that straddles the seizure boundary). This keeps pre/post-ictal
+        signal out of the negative class.
 
     Args:
-        time_of_sample_s: Window size in seconds (e.g., 0.25)
-        overlap: Overlap fraction (e.g., 0.5 for 50% overlap)
-        subjects: List of subjects to process
-        output_path: Output directory for windowed data
-        skip_beginning_s: Skip first N seconds of each minute (warmup)
+        time_of_sample_s: Window size in seconds (e.g., 2.0).
+        overlap: Overlap fraction (e.g., 0.5 for 50% overlap).
+        subjects: List of subjects whose spike trees should be windowed.
+        output_path: Output directory for windowed data.
+        skip_beginning_s: Skip first N seconds of each minute (warmup).
     """
     spikes_root = SPIKES_ROOT
+    seizures_by_edf = _load_seizures_for_subjects(subjects)
 
     # Discover which clk_freqs actually exist on disk for the first trial,
     # and pick the highest as the windowing sample rate.
@@ -548,7 +687,6 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
         "Theta": (4, 8),
         "Alpha": (8, 14),
         "Beta": (14, 32),
-        "Gamma": (32, 62),
     }
 
     # gather all trials
@@ -583,8 +721,11 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
     with tqdm(total=total_items, desc="Create dataset windows") as pbar:
         for trial in trials:
             trial_dir = os.path.join(spikes_root, trial)
-            for label in ["seizure", "non_seizure"]:
-                trial_label_dir = os.path.join(trial_dir, label)
+            # trial looks like "chb01/chb01_03.edf"; pull the EDF basename for seizure lookup
+            edf_name = Path(trial).name
+            seizure_intervals = seizures_by_edf.get(edf_name, [])
+            for minute_label in ["seizure", "non_seizure"]:
+                trial_label_dir = os.path.join(trial_dir, minute_label)
                 if not os.path.isdir(trial_label_dir):
                     continue
 
@@ -593,9 +734,16 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
                     minute_dir = os.path.join(trial_label_dir, minute)
                     full_minute_spikes_input = {}
 
+                    # Restrict windowing to the configured channel subset so that
+                    # any extra channels left over on disk from earlier runs are
+                    # ignored (otherwise we'd accidentally include them).
+                    allowed_channels = set(SELECT_BIPOLAR_CHANNELS)
+
                     # build inputs by bands/channels; SKIP empty bands
                     for band_name, (lf, hf) in bands.items():
                         for ch_name in os.listdir(minute_dir):
+                            if ch_name not in allowed_channels:
+                                continue
                             ch_dir = os.path.join(minute_dir, ch_name)
                             if not os.path.isdir(ch_dir):
                                 continue
@@ -681,12 +829,26 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
                         if not sample_spikes_input:
                             continue
 
-                        # File name = absolute time in seconds
-                        # minute_i * 60 gives the start of the minute in seconds
-                        # sample_start_index / sample_fs gives offset within minute
-                        absolute_time_s = minute_i * 60 + skip_beginning_s + (sample_start_index / sample_fs)
-                        file_name = f"{absolute_time_s:.3f}"
-                        out_path = Path(output_path) / trial / label / f"{file_name}.npz"
+                        # File name = absolute time in seconds (start of the window)
+                        absolute_start_s = minute_i * 60 + skip_beginning_s + (sample_start_index / sample_fs)
+                        absolute_end_s = absolute_start_s + time_of_sample_s
+
+                        # Per-window relabel:
+                        #   "seizure"     if the window overlaps any seizure interval
+                        #   "non_seizure" if the parent minute was selected as interictal
+                        #   else          discard (pre/post-ictal contamination)
+                        overlaps_seizure = _overlaps_any_seizure(
+                            absolute_start_s, absolute_end_s, seizure_intervals
+                        )
+                        if overlaps_seizure:
+                            window_label = "seizure"
+                        elif minute_label == "non_seizure":
+                            window_label = "non_seizure"
+                        else:
+                            continue  # seizure-minute window that's not actually ictal
+
+                        file_name = f"{absolute_start_s:.3f}"
+                        out_path = Path(output_path) / trial / window_label / f"{file_name}.npz"
                         out_path.parent.mkdir(parents=True, exist_ok=True)
                         if not out_path.is_file():
                             with open(out_path, "wb") as f:
@@ -731,13 +893,23 @@ def main():
                 process_file(subject, edf_file, desired_bipolar_channels, seizures_by_file)
                 pbar.update(1)
 
-    create_datasets(
-        time_of_sample_s=0.25,  # 250ms windows
-        overlap=0.5,  # 50% overlap (125ms step) for better temporal resolution
-        subjects=subjects,
-        output_path=OUTPUT_PATH,
-        skip_beginning_s=0,  # No skip needed for second-level processing
-    )
+    # Option B: training reads spikes_raw/ lazily; no need to pre-build a windowed
+    # cache. Set BUILD_WINDOWED_CACHE=1 to keep the legacy behaviour (writes the
+    # ~13 GB-per-EDF cache to OUTPUT_PATH).
+    if os.environ.get("BUILD_WINDOWED_CACHE", "0") == "1":
+        create_datasets(
+            time_of_sample_s=WINDOW_SECONDS,
+            overlap=WINDOW_OVERLAP,
+            subjects=subjects,
+            output_path=OUTPUT_PATH,
+            skip_beginning_s=0,
+        )
+    else:
+        n_windows = sum(1 for _ in enumerate_windows(
+            subjects, WINDOW_SECONDS, WINDOW_OVERLAP
+        ))
+        print(f"Skipping windowed-cache build (set BUILD_WINDOWED_CACHE=1 to enable).")
+        print(f"enumerate_windows() reports {n_windows} windows available for training.")
 
 if __name__ == "__main__":
     main()

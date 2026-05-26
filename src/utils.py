@@ -118,32 +118,53 @@ class Bands2TopographyLayer(Network):
 
 
 class Topographies2SNN(Network):
+    """Classifier SNN matching the SA paper (Hadad et al. 2024) layer sizing:
+
+        topography (5 bands × 121 cells)
+            ↓  PostPre STDP
+        input_layer (121 SCTNs — paper's "input layer", receives 5 × 121 inputs)
+            ↓  PostPre STDP
+        hidden1_layer (64 SCTNs)
+            ↓  PostPre STDP
+        hidden2_layer (32 SCTNs)
+            ↓  PostPre STDP
+        output_layer (2 SCTNs — seizure / non-seizure)
+    """
 
     def __init__(
         self,
         topography_maps: dict[str, Bands2TopographyLayer],
-        fc1_neurons: int,
-        fc2_neurons: int,
-        output_neurons: int,
+        input_neurons: int = 121,
+        hidden1_neurons: int = 64,
+        hidden2_neurons: int = 32,
+        output_neurons: int = 2,
     ):
         super().__init__()
         self.topography_maps = topography_maps
 
-        fc1_layer = LIFNodes(
-            n=fc1_neurons,
+        input_layer = LIFNodes(
+            n=input_neurons,
             traces=True,
             rest=0.0,
             thresh=10,
         )
-        self.add_layer(fc1_layer, name="fc1_layer")
+        self.add_layer(input_layer, name="input_layer")
 
-        fc2_layer = LIFNodes(
-            n=fc2_neurons,
+        hidden1_layer = LIFNodes(
+            n=hidden1_neurons,
             traces=True,
             rest=0.0,
             thresh=10,
         )
-        self.add_layer(fc2_layer, name="fc2_layer")
+        self.add_layer(hidden1_layer, name="hidden1_layer")
+
+        hidden2_layer = LIFNodes(
+            n=hidden2_neurons,
+            traces=True,
+            rest=0.0,
+            thresh=10,
+        )
+        self.add_layer(hidden2_layer, name="hidden2_layer")
 
         output_layer = LIFNodes(
             n=output_neurons,
@@ -153,41 +174,58 @@ class Topographies2SNN(Network):
         )
         self.add_layer(output_layer, name="output_layer")
 
-        # add full bands module
+        # Wire each band's topography into the input_layer.
         for band_name, topography_map in topography_maps.items():
-
             for layer_name, layer in topography_map.layers.items():
                 self.add_layer(layer, name=layer_name)
             for (source, target), conn in topography_map.connections.items():
                 self.add_connection(conn, source=source, target=target)
 
-            # Connections from topography to fc1
             topography_layer = topography_map.layers[f"{band_name}-topography"]
-            w = 0.3 * torch.rand(topography_layer.n, fc1_neurons)
-            fc1_conn = Connection(
-                source=topography_layer,
-                target=fc1_layer,
-                w=w,
-                update_rule=PostPre,
-            )
+            w = 0.3 * torch.rand(topography_layer.n, input_neurons)
             self.add_connection(
-                fc1_conn, source=f"{band_name}-topography", target="fc1_layer"
+                Connection(
+                    source=topography_layer,
+                    target=input_layer,
+                    w=w,
+                    update_rule=PostPre,
+                ),
+                source=f"{band_name}-topography",
+                target="input_layer",
             )
 
-        w = 0.3 * torch.rand(fc1_neurons, fc2_neurons)
-        fc2_conn = Connection(
-            source=fc1_layer,
-            target=fc2_layer,
-            w=w,
-            update_rule=PostPre,
+        # input_layer → hidden1_layer
+        self.add_connection(
+            Connection(
+                source=input_layer,
+                target=hidden1_layer,
+                w=0.3 * torch.rand(input_neurons, hidden1_neurons),
+                update_rule=PostPre,
+            ),
+            source="input_layer",
+            target="hidden1_layer",
         )
-        self.add_connection(fc2_conn, source=f"fc1_layer", target="fc2_layer")
 
-        w = 0.3 * torch.rand(fc2_neurons, output_neurons)
-        output_conn = Connection(
-            source=fc2_layer,
-            target=output_layer,
-            w=w,
-            update_rule=PostPre,
+        # hidden1_layer → hidden2_layer
+        self.add_connection(
+            Connection(
+                source=hidden1_layer,
+                target=hidden2_layer,
+                w=0.3 * torch.rand(hidden1_neurons, hidden2_neurons),
+                update_rule=PostPre,
+            ),
+            source="hidden1_layer",
+            target="hidden2_layer",
         )
-        self.add_connection(output_conn, source=f"fc2_layer", target="output_layer")
+
+        # hidden2_layer → output_layer
+        self.add_connection(
+            Connection(
+                source=hidden2_layer,
+                target=output_layer,
+                w=0.3 * torch.rand(hidden2_neurons, output_neurons),
+                update_rule=PostPre,
+            ),
+            source="hidden2_layer",
+            target="output_layer",
+        )

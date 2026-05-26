@@ -1,27 +1,29 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Evaluate a trained SNN classifier on CHB-MIT spike dataset.
+Evaluate the trained SA-style SNN on CHB-MIT seizure windows.
 
-Loads the model from:
-    ../output_data/trained_models/trained_chbmit_model.pth
-
-Evaluates on all .npz windows from:
-    ../dataset/spikes_windowed/
-
-Outputs metrics, confusion matrix, and ROC/PR plots to:
-    ../output_data/results/
+Inference is a pure BindsNet forward pass (no clamp). The predicted label is the
+argmax of the per-window output-neuron spike counts.
 """
+import sys
+import types
 
-import os
+# bindsnet 0.3.x compat shim — same as 3.run_train_chbmit.py.
+if "torch._six" not in sys.modules:
+    _shim = types.ModuleType("torch._six")
+    _shim.container_abcs = ()
+    _shim.string_classes = (str,)
+    _shim.int_classes = (int,)
+    sys.modules["torch._six"] = _shim
+
 import pickle
-import numpy as np
-import torch
-import torch.nn as nn
 from pathlib import Path
-from tqdm import tqdm
+
+import numpy as np
+import pandas as pd
+import torch
 import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
 from sklearn.metrics import (
     confusion_matrix,
     classification_report,
@@ -29,229 +31,178 @@ from sklearn.metrics import (
     auc,
     precision_recall_curve,
 )
-import pandas as pd
-import seaborn as sns
-import sys, types
-if "torch._six" not in sys.modules:
-    m = types.ModuleType("torch._six")
-    m.container_abcs = ()
-    m.string_classes = (str,)
-    m.int_classes = (int,)
-    sys.modules["torch._six"] = m
+from bindsnet.network.monitors import Monitor
 
-# ------------------------------------------------------------
-# Config
-# ------------------------------------------------------------
-DATASET_PATH = Path("../dataset/spikes_windowed")
-MODEL_PATH = Path("../output_data/trained_models/trained_chbmit_model.pth")
-OUT_DIR = Path("../output_data/results")
+# Reuse the build / config from the training script (single source of truth).
+import importlib.util as _ilu
+
+_TRAIN_PATH = Path(__file__).resolve().parent / "3.run_train_chbmit.py"
+_spec = _ilu.spec_from_file_location("train_chbmit", _TRAIN_PATH)
+_train_mod = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_train_mod)
+
+BANDS = _train_mod.BANDS
+CHANNELS = _train_mod.CHANNELS
+build_snn = _train_mod.build_snn
+_build_window_inputs = _train_mod._build_window_inputs
+_MinuteCache = _train_mod._MinuteCache
+enumerate_windows = _train_mod.enumerate_windows
+WINDOW_SECONDS = _train_mod.WINDOW_SECONDS
+WINDOW_OVERLAP = _train_mod.WINDOW_OVERLAP
+DEVICE = _train_mod.DEVICE
+
+
+# ==========================================================
+# Paths
+# ==========================================================
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT = _SCRIPT_DIR.parent
+MODEL_PATH = _PROJECT_ROOT / "output_data" / "trained_models" / "snn_weights.pt"
+OUT_DIR = _PROJECT_ROOT / "output_data" / "results"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 16  # Increase to 32 or 64 if you have enough GPU memory
-
-# GPU optimization settings
-if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True
-    torch.cuda.empty_cache()
-    print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
-else:
-    print("⚠️  Running on CPU (CUDA not available)")
-
-# ------------------------------------------------------------
-# Model definition (same as used in training)
-# ------------------------------------------------------------
-from utils import Topographies2SNN, Bands2TopographyLayer, Resonators2BandsLayer
-
-full_resonator_array = torch.tensor([
-    1.10, 1.30, 1.60, 1.90, 2.20, 2.50, 2.88, 3.05, 3.39,
-    3.70, 4.12, 4.62, 5.09, 5.45, 5.87, 6.36, 6.80, 7.60, 8.60
-], dtype=torch.float32)
-
-# full_resonator_array = torch.tensor([
-#     1.1, 1.3, 1.6, 1.9, 2.2, 2.5, 2.88, 3.05, 3.39, 3.7, 4.12, 4.62, 5.09, 5.45, 5.87, 6.36, 6.8, 7.6, 8.6,
-#     10.5, 11.5, 12.8, 15.8, 16.6, 19.4, 22.0, 24.8, 28.4, 30.5, 34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2
-# ], dtype=torch.float32)
-
-bands = {
-    "Delta": (0.5, 4),
-    "Theta": (4, 8),
-    "Alpha": (8, 14),
-    "Beta": (14, 32),
-    "Gamma": (32, 62),
-}
-
-channels = [
-    "O2", "P8", "T8", "FC6", "F4", "F8", "AF4", "AF3",
-    "F7", "F3", "FC5", "T7", "P7", "O1"
-]
-
-N = 11
-xs = (np.array([-0.7,-0.66,0,0.2,0.4,0.5,0.7,0.7,0.5,0.4,0.2,0,-0.66,-0.7]) + 1) / 2
-ys = (-np.array([0.2,0.6,0.95,0.6,0.3,0.6,0.2,-0.2,-0.6,-0.3,-0.6,-0.95,-0.6,-0.2]) + 1) / 2
-ch_pos = {ch: (x, y) for ch, (x, y) in zip(channels, zip(ys, xs))}
-ch_pos_N = {k: (int(x * N), int(y * N)) for k, (x, y) in ch_pos.items()}
+SUBJECTS = ["chb01"]
 
 
-def build_snn():
-    bands2topographies = {}
-    for band, (lf, hf) in bands.items():
-        resonators2band = {}
-        for ch in ch_pos.keys():
-            freqs = full_resonator_array[
-                (full_resonator_array >= lf) & (full_resonator_array < hf)
-            ]
-            if len(freqs) == 0:
+# ==========================================================
+# Load weights
+# ==========================================================
+def load_weights_into(snn, weights_path: Path):
+    weights = torch.load(weights_path, map_location=DEVICE)
+    loaded = 0
+    for (src, tgt), conn in snn.connections.items():
+        key = f"{src}__{tgt}"
+        if key in weights:
+            w = weights[key].to(conn.w.device).to(conn.w.dtype)
+            if w.shape != conn.w.shape:
+                print(f"  shape mismatch on {key}: saved={w.shape} vs current={conn.w.shape}; skipping")
                 continue
-            clk_freqs = torch.where(freqs < 10, 15360, 153600)
-            resonators2band[ch] = Resonators2BandsLayer(ch, band, clk_freqs)
-        bands2topographies[band] = Bands2TopographyLayer(
-            band, resonators2band, shape=(N, N), ch_pos=ch_pos_N
-        )
-    snn = Topographies2SNN(bands2topographies, N * N, N * int(np.sqrt(N)), 3)
-    return snn
+            conn.w.copy_(w)
+            loaded += 1
+    print(f"Loaded weights into {loaded}/{len(snn.connections)} connections")
 
 
-class EEGClassifier(nn.Module):
-    def __init__(self, snn_out_dim, num_classes=2):
-        super().__init__()
-        self.snn = build_snn()
-        self.fc = nn.Sequential(
-            nn.Linear(snn_out_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes)
-        )
+# ==========================================================
+# Inference
+# ==========================================================
+def predict(snn, subjects):
+    """Lazy-load each window from `spikes_raw/`, run the SNN, return per-window
+    (true, pred, prob_of_seizure) arrays."""
+    snn.train(mode=False)
+    out_layer_name = "output_layer"
 
-    def forward(self, x):
-        return self.fc(x)
+    windows = list(enumerate_windows(subjects, WINDOW_SECONDS, WINDOW_OVERLAP))
+    cache = _MinuteCache(capacity=4)
 
-
-# ------------------------------------------------------------
-# Dataset loading
-# ------------------------------------------------------------
-def load_dataset(path):
-    files = list(Path(path).rglob("*.npz"))
-    if not files:
-        raise FileNotFoundError(f"No .npz files found under {path.resolve()}")
-
-    X, y = [], []
-    for f in tqdm(files, desc=f"Loading dataset from {path.name}"):
-        label = 1 if "seizure" in f.parts[-2].lower() else 0
+    trues, preds, scores = [], [], []
+    for win in tqdm(windows, desc="Evaluating"):
         try:
-            with open(f, "rb") as fp:
-                data = pickle.load(fp)
-            arrs = []
-            for v in data.values():
-                if hasattr(v, "shape"):
-                    arrs.append(v.detach().cpu().numpy().flatten())
-                elif isinstance(v, (list, tuple)):
-                    arrs.extend(np.array(v, dtype=float).flatten())
-            if not arrs:
-                continue
-            X.append(np.concatenate(arrs))
-            y.append(label)
-        except Exception as e:
-            print(f"⚠️ Skipping {f.name}: {e}")
+            inputs, label = _build_window_inputs(win, cache)
+        except FileNotFoundError as e:
+            print(f"  skip window {win['abs_start_s']:.2f}s: missing file {e}")
+            continue
+        if not inputs:
             continue
 
-    X = np.stack(X)
-    y = np.array(y)
-    print(f"✅ Loaded {len(X)} samples ({sum(y)} seizure, {len(y)-sum(y)} non-seizure)")
-    return X, y
+        T = next(iter(inputs.values())).shape[0]
+        inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+        # Fresh monitor per window so the spike count is per-window only.
+        monitor = Monitor(snn.layers[out_layer_name], state_vars=("s",), time=T)
+        snn.add_monitor(monitor, name="out_eval")
+        try:
+            snn.run(inputs=inputs, time=T)
+            spikes = monitor.get("s")
+            counts = spikes.sum(dim=tuple(range(spikes.ndim - 1))).float().cpu()
+            pred = int(counts.argmax().item())
+            total = counts.sum().item()
+            score = float(counts[1].item() / total) if total > 0 else 0.5
+        finally:
+            del snn.monitors["out_eval"]
+            snn.reset_state_variables()
+
+        trues.append(label)
+        preds.append(pred)
+        scores.append(score)
+
+    return np.array(trues), np.array(preds), np.array(scores)
 
 
-# ------------------------------------------------------------
-# Evaluation
-# ------------------------------------------------------------
-def evaluate(model, X, y):
-    model.to(DEVICE)
-    model.eval()
-    dataset = torch.utils.data.TensorDataset(
-        torch.tensor(X, dtype=torch.float32),
-        torch.tensor(y, dtype=torch.long)
+# ==========================================================
+# Metrics + plots
+# ==========================================================
+def report_and_plot(trues, preds, scores):
+    cm = confusion_matrix(trues, preds, labels=[0, 1])
+    report = classification_report(
+        trues, preds, target_names=["non_seizure", "seizure"], output_dict=True
     )
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-    preds, probs, trues = [], [], []
-    with torch.no_grad():
-        for batch_X, batch_y in dataloader:
-            batch_X = batch_X.to(DEVICE)
-            outputs = model(batch_X)
-            p = torch.softmax(outputs, dim=1)
-            preds.extend(torch.argmax(p, dim=1).cpu().numpy())
-            probs.extend(p[:, 1].cpu().numpy())  # seizure prob
-            trues.extend(batch_y.cpu().numpy())
-
-    preds = np.array(preds)
-    probs = np.array(probs)
-    trues = np.array(trues)
-
-    # Metrics
-    cm = confusion_matrix(trues, preds)
-    report = classification_report(trues, preds, output_dict=True)
     acc = report["accuracy"]
-
-    print(f"\n✅ Evaluation complete | Accuracy = {acc:.4f}\n")
+    print(f"\nAccuracy = {acc:.4f}\n")
     print(pd.DataFrame(report).T)
 
-    # Save metrics
-    metrics_path = OUT_DIR / "eval_summary.csv"
-    pd.DataFrame(report).T.to_csv(metrics_path)
-    print(f"[INFO] Saved metrics: {metrics_path}")
+    pd.DataFrame(report).T.to_csv(OUT_DIR / "eval_summary.csv")
+    print(f"Saved: {OUT_DIR / 'eval_summary.csv'}")
 
-    # Confusion matrix
     plt.figure(figsize=(4, 4))
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                xticklabels=["Non-Seizure", "Seizure"],
-                yticklabels=["Non-Seizure", "Seizure"])
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=["Non-Seizure", "Seizure"],
+        yticklabels=["Non-Seizure", "Seizure"],
+    )
     plt.xlabel("Predicted")
     plt.ylabel("True")
     plt.title("Confusion Matrix")
-    cm_path = OUT_DIR / "confusion_matrix.png"
     plt.tight_layout()
-    plt.savefig(cm_path)
+    plt.savefig(OUT_DIR / "confusion_matrix.png")
     plt.close()
-    print(f"[INFO] Saved confusion matrix: {cm_path}")
+    print(f"Saved: {OUT_DIR / 'confusion_matrix.png'}")
 
-    # ROC curve
-    fpr, tpr, _ = roc_curve(trues, probs)
-    roc_auc = auc(fpr, tpr)
-    plt.figure()
-    plt.plot(fpr, tpr, label=f"ROC (AUC = {roc_auc:.2f})")
-    plt.plot([0, 1], [0, 1], "k--")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("ROC Curve")
-    plt.legend()
-    roc_path = OUT_DIR / "roc_curve.png"
-    plt.savefig(roc_path)
-    plt.close()
-    print(f"[INFO] Saved ROC curve: {roc_path}")
+    # ROC / PR only make sense if both classes are present.
+    if len(np.unique(trues)) == 2:
+        fpr, tpr, _ = roc_curve(trues, scores)
+        roc_auc = auc(fpr, tpr)
+        plt.figure()
+        plt.plot(fpr, tpr, label=f"ROC (AUC = {roc_auc:.2f})")
+        plt.plot([0, 1], [0, 1], "k--")
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title("ROC Curve")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(OUT_DIR / "roc_curve.png")
+        plt.close()
 
-    # Precision-recall
-    precision, recall, _ = precision_recall_curve(trues, probs)
-    plt.figure()
-    plt.plot(recall, precision, label="PR Curve")
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title("Precision-Recall Curve")
-    pr_path = OUT_DIR / "precision_recall_curve.png"
-    plt.savefig(pr_path)
-    plt.close()
-    print(f"[INFO] Saved PR curve: {pr_path}")
+        precision, recall, _ = precision_recall_curve(trues, scores)
+        plt.figure()
+        plt.plot(recall, precision, label="PR Curve")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title("Precision-Recall Curve")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(OUT_DIR / "precision_recall_curve.png")
+        plt.close()
+        print(f"Saved: {OUT_DIR / 'roc_curve.png'}, {OUT_DIR / 'precision_recall_curve.png'}")
 
 
-# ------------------------------------------------------------
+# ==========================================================
 # Main
-# ------------------------------------------------------------
-if __name__ == "__main__":
-    print(f"Running evaluation on: {DEVICE}")
+# ==========================================================
+def main():
+    print(f"Device = {DEVICE}")
 
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Trained model not found: {MODEL_PATH}")
 
-    X, y = load_dataset(DATASET_PATH)
-    model = EEGClassifier(snn_out_dim=X.shape[1])
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+    snn = build_snn()
+    snn.to(DEVICE)
+    load_weights_into(snn, MODEL_PATH)
 
-    evaluate(model, X, y)
+    trues, preds, scores = predict(snn, SUBJECTS)
+    report_and_plot(trues, preds, scores)
+
+
+if __name__ == "__main__":
+    main()
