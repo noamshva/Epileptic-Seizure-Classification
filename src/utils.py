@@ -1,4 +1,5 @@
 import math
+import os
 
 import numpy as np
 import torch
@@ -7,6 +8,15 @@ from bindsnet.learning import PostPre
 from bindsnet.network import Network
 from bindsnet.network.nodes import LIFNodes, Input
 from bindsnet.network.topology import Connection
+
+# --- tunable classifier hyperparameters (env-overridable for cheap sweeps) ---
+# The fully-connected classifier layers were starving the output layer: with
+# thresh=10 and init weights ~0.15, the membrane couldn't accumulate to
+# threshold before leaking, so output never spiked. Lower threshold and/or
+# larger init weight scale let the deep layers fire. Sweep with
+# src/diagnose_snn_activity.py (no training needed) before committing to a run.
+FC_THRESH = float(os.environ.get("FC_THRESH", "10"))       # classifier LIF threshold
+FC_W_SCALE = float(os.environ.get("FC_W_SCALE", "0.3"))    # init weight scale (× rand)
 
 
 class Resonators2BandsLayer(Network):
@@ -146,7 +156,7 @@ class Topographies2SNN(Network):
             n=input_neurons,
             traces=True,
             rest=0.0,
-            thresh=10,
+            thresh=FC_THRESH,
         )
         self.add_layer(input_layer, name="input_layer")
 
@@ -154,7 +164,7 @@ class Topographies2SNN(Network):
             n=hidden1_neurons,
             traces=True,
             rest=0.0,
-            thresh=10,
+            thresh=FC_THRESH,
         )
         self.add_layer(hidden1_layer, name="hidden1_layer")
 
@@ -162,7 +172,7 @@ class Topographies2SNN(Network):
             n=hidden2_neurons,
             traces=True,
             rest=0.0,
-            thresh=10,
+            thresh=FC_THRESH,
         )
         self.add_layer(hidden2_layer, name="hidden2_layer")
 
@@ -170,7 +180,7 @@ class Topographies2SNN(Network):
             n=output_neurons,
             traces=True,
             rest=0.0,
-            thresh=10,
+            thresh=FC_THRESH,
         )
         self.add_layer(output_layer, name="output_layer")
 
@@ -182,7 +192,7 @@ class Topographies2SNN(Network):
                 self.add_connection(conn, source=source, target=target)
 
             topography_layer = topography_map.layers[f"{band_name}-topography"]
-            w = 0.3 * torch.rand(topography_layer.n, input_neurons)
+            w = FC_W_SCALE * torch.rand(topography_layer.n, input_neurons)
             self.add_connection(
                 Connection(
                     source=topography_layer,
@@ -199,7 +209,7 @@ class Topographies2SNN(Network):
             Connection(
                 source=input_layer,
                 target=hidden1_layer,
-                w=0.3 * torch.rand(input_neurons, hidden1_neurons),
+                w=FC_W_SCALE * torch.rand(input_neurons, hidden1_neurons),
                 update_rule=PostPre,
             ),
             source="input_layer",
@@ -211,7 +221,7 @@ class Topographies2SNN(Network):
             Connection(
                 source=hidden1_layer,
                 target=hidden2_layer,
-                w=0.3 * torch.rand(hidden1_neurons, hidden2_neurons),
+                w=FC_W_SCALE * torch.rand(hidden1_neurons, hidden2_neurons),
                 update_rule=PostPre,
             ),
             source="hidden1_layer",
@@ -223,7 +233,7 @@ class Topographies2SNN(Network):
             Connection(
                 source=hidden2_layer,
                 target=output_layer,
-                w=0.3 * torch.rand(hidden2_neurons, output_neurons),
+                w=FC_W_SCALE * torch.rand(hidden2_neurons, output_neurons),
                 update_rule=PostPre,
             ),
             source="hidden2_layer",

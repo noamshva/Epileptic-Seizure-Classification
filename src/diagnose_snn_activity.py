@@ -89,8 +89,10 @@ def main():
             snn.add_monitor(m, name=f"diag_{lname}")
             monitors[lname] = m
 
+        import utils as _u
         print(f"\n=== window @ {win['abs_start_s']:.1f}s  label={'seizure' if label==1 else 'non_seizure'}  "
-              f"(BIN_FACTOR={_t.BIN_FACTOR}, T={T}) ===")
+              f"(BIN_FACTOR={_t.BIN_FACTOR}, T={T}, "
+              f"FC_THRESH={_u.FC_THRESH}, FC_W_SCALE={_u.FC_W_SCALE}) ===")
         snn.run(inputs=inputs, time=T)
 
         # Aggregate spikes per layer, grouped for readability
