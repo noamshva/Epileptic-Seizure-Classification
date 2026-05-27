@@ -72,8 +72,22 @@ def main():
 
     # Attach a spike monitor to every layer
     windows = list(_t.enumerate_windows(["chb01"], _t.WINDOW_SECONDS, _t.WINDOW_OVERLAP))
-    seiz = next(w for w in windows if w["window_label"] == "seizure")
-    non = next(w for w in windows if w["window_label"] == "non_seizure")
+    # Pick the MOST-ictal seizure window (deepest inside the seizure interval),
+    # not the first one — the first overlaps the seizure by only ~1 s at onset
+    # and would understate any class difference. We approximate "deepest" as the
+    # seizure window whose start is furthest from the pool's earliest seizure
+    # window (i.e. well past onset).
+    seiz_windows = [w for w in windows if w["window_label"] == "seizure"]
+    non_windows = [w for w in windows if w["window_label"] == "non_seizure"]
+    if not seiz_windows or not non_windows:
+        raise RuntimeError("need both seizure and non_seizure windows")
+    # middle of the seizure window list = roughly the centre of the seizure
+    seiz = seiz_windows[len(seiz_windows) // 2]
+    non = non_windows[len(non_windows) // 2]
+    print(f"Chosen seizure window:     start={seiz['abs_start_s']:.1f}s "
+          f"(of {len(seiz_windows)} seizure windows)")
+    print(f"Chosen non-seizure window: start={non['abs_start_s']:.1f}s "
+          f"(of {len(non_windows)} non-seizure windows)")
     probe = [seiz, non][: args.n_windows]
 
     cache = _t._MinuteCache(capacity=2)
