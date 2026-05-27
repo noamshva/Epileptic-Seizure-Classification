@@ -15,7 +15,7 @@ from bindsnet.network.topology import Connection
 # threshold before leaking, so output never spiked. Lower threshold and/or
 # larger init weight scale let the deep layers fire. Sweep with
 # src/diagnose_snn_activity.py (no training needed) before committing to a run.
-FC_THRESH = float(os.environ.get("FC_THRESH", "10"))       # classifier LIF threshold
+FC_THRESH = float(os.environ.get("FC_THRESH", "2"))        # classifier LIF threshold
 FC_W_SCALE = float(os.environ.get("FC_W_SCALE", "0.3"))    # init weight scale (× rand)
 
 

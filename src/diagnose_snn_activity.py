@@ -90,14 +90,18 @@ def main():
           f"(of {len(non_windows)} non-seizure windows)")
     probe = [seiz, non][: args.n_windows]
 
-    cache = _t._MinuteCache(capacity=2)
+    cache = _t._MinuteCache(capacity=8)
+
+    # Calibrate per-resonator burstiness baseline over ALL windows (z-scoring).
+    print("Calibrating burstiness baseline over all windows...")
+    baseline = _t.calibrate_burstiness(windows, cache)
 
     # Collect per-neuron spike-count vectors per window so we can compare
     # whether the representation actually differs between classes.
     per_neuron_vectors = {}   # label_str -> {layer_name: np.ndarray[n_neurons]}
 
     for win in probe:
-        inputs, label = _t._build_window_inputs(win, cache)
+        inputs, label = _t._build_window_inputs(win, cache, baseline=baseline)
         T = next(iter(inputs.values())).shape[0]
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -109,8 +113,8 @@ def main():
 
         import utils as _u
         print(f"\n=== window @ {win['abs_start_s']:.1f}s  label={'seizure' if label==1 else 'non_seizure'}  "
-              f"(BIN_FACTOR={_t.BIN_FACTOR}, T={T}, "
-              f"FC_THRESH={_u.FC_THRESH}, FC_W_SCALE={_u.FC_W_SCALE}) ===")
+              f"(SIM_TIME={_t.SIM_TIME}, T={T}, BURST_BIAS={_t.BURST_BIAS}, "
+              f"BURST_GAIN={_t.BURST_GAIN}, FC_THRESH={_u.FC_THRESH}) ===")
         snn.run(inputs=inputs, time=T)
 
         # Aggregate spikes per layer, grouped for readability

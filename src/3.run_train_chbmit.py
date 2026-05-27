@@ -7,6 +7,7 @@ During training we drive the network with the per-window spike trains and
 **clamp** the correct output neuron to spike, which is the standard BindsNet
 recipe for supervised STDP. No PyTorch optimizer / backprop.
 """
+import os
 import sys
 import types
 
@@ -45,7 +46,7 @@ OUTPUT_LOG_DIR = _PROJECT_ROOT / "output_data" / "train_logs"
 OUTPUT_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-EPOCHS = 10
+EPOCHS = int(os.environ["EPOCHS"]) if "EPOCHS" in os.environ else 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 if torch.cuda.is_available():
@@ -183,18 +184,48 @@ BAND_RESONATORS = {
 }
 _SAMPLE_FS = 153_600        # encoded-spike rate (resonator high clock)
 
-# Temporal binning for the SNN. The encoded spike trains on disk stay at the
-# full 153.6 kHz rate; this is just how many of those ticks we collapse into a
-# single SNN simulation step. BIN_FACTOR=1 means no binning (paper fidelity).
-# Each output bin holds the SUM of spikes in that window (0..BIN_FACTOR per
-# resonator per bin). Larger BIN_FACTOR -> fewer SNN ticks per window ->
-# proportionally faster training, at the cost of timing precision finer than
-# BIN_FACTOR / _SAMPLE_FS seconds.
-BIN_FACTOR = int(os.environ.get("BIN_FACTOR", "1"))
+# ---------------------------------------------------------------------------
+# Burstiness readout.
+#
+# The resonator output is a delta-sigma stream: its mean spike rate is ~50%
+# regardless of the input, so a spike-COUNT readout is blind. The seizure
+# signal lives in the *local-density variance* (burstiness): during a seizure
+# the resonator output is bunched into bursts; during calm it is smooth.
+#
+# Pipeline per 2-second window:
+#   1. bin each resonator's output into BURST_BIN_MS windows -> local density
+#   2. burstiness = std of that local density over the window
+#   3. rate-encode burstiness as a Poisson spike train over SIM_TIME ticks
+#      (rate = clip(burstiness / BURST_SCALE, 0, 1))
+#   4. feed that into the SAME SNN (Resonators2BandsLayer -> topography ->
+#      classifier). Now the input *rate* carries the discriminative feature,
+#      so the SNN's rate-based processing is no longer blind.
+#
+# This also makes each window a SIM_TIME-tick simulation (~250) instead of
+# 38,400, so training is minutes not hours.
+SIM_TIME    = int(os.environ.get("SIM_TIME", "500"))        # SNN ticks per window
+BURST_BIN_MS = float(os.environ.get("BURST_BIN_MS", "10"))  # local-density bin width
+# z-score rate encoding: rate = clip(BURST_BIAS + z * BURST_GAIN, 0, 1), where z is
+# the per-resonator burstiness z-score (relative to its baseline over all windows).
+# A resonator at its mean burstiness fires at BURST_BIAS; one +k std above fires more.
+# Defaults chosen so discriminating resonators fire well above baseline.
+BURST_BIAS  = float(os.environ.get("BURST_BIAS", "0.30"))
+BURST_GAIN  = float(os.environ.get("BURST_GAIN", "0.35"))
+_BURST_SEED = int(os.environ.get("BURST_SEED", "0"))        # Poisson encoding seed
 
 
 def _clk_of(f0: float) -> int:
     return 15_360 if f0 < 10 else 153_600
+
+
+def _resonator_burstiness(spike_arr: np.ndarray, clk: int) -> float:
+    """std of the BURST_BIN_MS-binned local spike density over the window."""
+    bin_size = max(1, int(clk * BURST_BIN_MS / 1000.0))
+    n_bins = len(spike_arr) // bin_size
+    if n_bins < 2:
+        return 0.0
+    binned = spike_arr[: n_bins * bin_size].reshape(n_bins, bin_size).sum(axis=1)
+    return float(binned.std())
 
 
 class _MinuteCache:
@@ -240,52 +271,82 @@ class _MinuteCache:
         return per_ch_band
 
 
-def _build_window_inputs(win_desc, cache: _MinuteCache):
-    """Slice a 2-sec window out of the cached per-minute spikes and return the
-    BindsNet input dict (keyed by '<ch>-<band>-resonators') plus the int label.
+_BASELINE_PATH = OUTPUT_MODEL_DIR / "burstiness_baseline.pkl"
 
-    Slow-clock spikes are upsampled to _SAMPLE_FS by zero-insertion, so every
-    input tensor has shape [_SAMPLE_FS * WINDOW_SECONDS, n_resonators].
-    """
+
+def _save_baseline(baseline):
+    with open(_BASELINE_PATH, "wb") as f:
+        pickle.dump(baseline, f)
+
+
+def _load_baseline():
+    if _BASELINE_PATH.exists():
+        with open(_BASELINE_PATH, "rb") as f:
+            return pickle.load(f)
+    return None
+
+
+def _window_burstiness(win_desc, cache: _MinuteCache):
+    """Return dict[(ch, band)] -> np.ndarray[n_res] of raw per-resonator burstiness."""
     minute_data = cache.get(
         win_desc["subject"], win_desc["trial"],
         win_desc["minute_label"], win_desc["minute"],
     )
     sec_offset = win_desc["sec_offset_in_minute"]
-    target_len = int(_SAMPLE_FS * WINDOW_SECONDS)
-
-    inputs: dict[str, torch.Tensor] = {}
+    out: dict[tuple[str, str], np.ndarray] = {}
     for (ch, band), per_res in minute_data.items():
-        stacks = []
+        burst = []
         for clk, arr in per_res:
             start = int(round(sec_offset * clk))
             end = start + int(round(WINDOW_SECONDS * clk))
-            slice_arr = arr[start:end]
-            if clk != _SAMPLE_FS:
-                stride = _SAMPLE_FS // clk
-                up = np.zeros(target_len, dtype=np.int8)
-                fill = slice_arr[: up[::stride].size]
-                up[::stride][: fill.size] = fill
-                slice_arr = up
-            else:
-                if slice_arr.size != target_len:
-                    pad = np.zeros(target_len, dtype=np.int8)
-                    pad[: slice_arr.size] = slice_arr[:target_len]
-                    slice_arr = pad
-            stacks.append(slice_arr)
-        if not stacks:
-            continue
-        # [n_res, T_full] — sum-bin along the time axis if BIN_FACTOR > 1
-        stacked = np.stack(stacks)
-        if BIN_FACTOR > 1:
-            T_full = stacked.shape[1]
-            T_binned = T_full // BIN_FACTOR
-            # Trim to a multiple of BIN_FACTOR, then sum within each bin
-            stacked = stacked[:, : T_binned * BIN_FACTOR]
-            stacked = stacked.reshape(stacked.shape[0], T_binned, BIN_FACTOR).sum(axis=2)
-        # [n_res, T] → [T, n_res], float32 for BindsNet
-        tensor = torch.from_numpy(stacked).T.contiguous().float()
-        inputs[f"{ch}-{band}-resonators"] = tensor
+            burst.append(_resonator_burstiness(arr[start:end], clk))
+        if burst:
+            out[(ch, band)] = np.asarray(burst, dtype=np.float64)
+    return out
+
+
+def calibrate_burstiness(windows, cache: _MinuteCache):
+    """One pass over windows: per-(ch,band) per-resonator mean & std of burstiness.
+
+    Returns dict[(ch, band)] -> (mean[n_res], std[n_res]). Used to z-score each
+    resonator so the encoding is scale-free across clock rates and amplifies
+    resonators that spike up during seizures.
+    """
+    acc: dict[tuple[str, str], list] = {}
+    for win in windows:
+        for k, v in _window_burstiness(win, cache).items():
+            acc.setdefault(k, []).append(v)
+    baseline = {}
+    for k, vs in acc.items():
+        M = np.stack(vs)                       # [n_windows, n_res]
+        baseline[k] = (M.mean(axis=0), M.std(axis=0) + 1e-6)
+    return baseline
+
+
+def _build_window_inputs(win_desc, cache: _MinuteCache, baseline=None, rng=None):
+    """Build the BindsNet input dict for one window from per-resonator burstiness,
+    z-scored against `baseline` and rate-encoded over SIM_TIME ticks.
+
+    If baseline is None, falls back to a raw scale (BURST_BIAS used as divisor).
+    Returns (inputs, label).
+    """
+    if rng is None:
+        seed = (_BURST_SEED * 1_000_003
+                + int(round(win_desc["abs_start_s"] * 1000))) & 0x7FFFFFFF
+        rng = np.random.default_rng(seed)
+
+    bw = _window_burstiness(win_desc, cache)
+
+    inputs: dict[str, torch.Tensor] = {}
+    for (ch, band), burst in bw.items():
+        if baseline is not None and (ch, band) in baseline:
+            mean, std = baseline[(ch, band)]
+            z = (burst - mean) / std
+            rate = np.clip(BURST_BIAS + z * BURST_GAIN, 0.0, 1.0)
+        else:
+            rate = np.clip(burst / 5.0, 0.0, 1.0)
+        spikes = (rng.random((SIM_TIME, rate.shape[0])) < rate).astype(np.float32)
+        inputs[f"{ch}-{band}-resonators"] = torch.from_numpy(spikes)
 
     label = 1 if win_desc["window_label"] == "seizure" else 0
     return inputs, label
@@ -319,11 +380,25 @@ def train_snn(snn, subjects, epochs=EPOCHS, shuffle: bool = True, max_windows=No
     n_seiz = sum(1 for w in windows if w["window_label"] == "seizure")
     n_non = len(windows) - n_seiz
     print(f"enumerate_windows -> {len(windows)} windows ({n_seiz} seizure, {n_non} non-seizure)")
+
+    # Class balancing: subsample non-seizure to match seizure count (BALANCE=1, default on).
+    if os.environ.get("BALANCE", "1") == "1" and n_seiz and n_non > n_seiz:
+        seiz_w = [w for w in windows if w["window_label"] == "seizure"]
+        non_w = [w for w in windows if w["window_label"] == "non_seizure"]
+        rng_bal = np.random.default_rng(0)
+        non_w = [non_w[i] for i in rng_bal.choice(len(non_w), size=n_seiz, replace=False)]
+        windows = seiz_w + non_w
+        print(f"(balanced to {len(windows)} windows: {len(seiz_w)} seizure, {len(non_w)} non-seizure)")
+
     if max_windows is not None:
         windows = windows[:max_windows]
         print(f"(capped to {len(windows)} windows for this run)")
 
-    cache = _MinuteCache(capacity=4)
+    cache = _MinuteCache(capacity=8)
+
+    print("Calibrating per-resonator burstiness baseline...")
+    baseline = calibrate_burstiness(windows, cache)
+    _save_baseline(baseline)
 
     epoch_losses, epoch_accs = [], []
     for epoch in range(epochs):
@@ -332,7 +407,7 @@ def train_snn(snn, subjects, epochs=EPOCHS, shuffle: bool = True, max_windows=No
         correct, seen = 0, 0
         for win in tqdm(windows, desc=f"epoch {epoch + 1}/{epochs}"):
             try:
-                inputs, label = _build_window_inputs(win, cache)
+                inputs, label = _build_window_inputs(win, cache, baseline=baseline)
             except FileNotFoundError as e:
                 print(f"  skip window {win['abs_start_s']:.2f}s: missing file {e}")
                 continue
@@ -383,11 +458,9 @@ SUBJECTS = ["chb01"]   # which subjects to read from dataset/spikes_raw/
 
 def main():
     print(f"Device = {DEVICE}")
-    sim_T = (int(_SAMPLE_FS * WINDOW_SECONDS)
-             // (BIN_FACTOR if BIN_FACTOR > 0 else 1))
-    print(f"Config: EPOCHS={EPOCHS}  BIN_FACTOR={BIN_FACTOR}  "
-          f"SNN ticks/window={sim_T:,}  "
-          f"(sample_fs={_SAMPLE_FS} Hz, window={WINDOW_SECONDS}s)")
+    print(f"Config: EPOCHS={EPOCHS}  readout=burstiness  SIM_TIME={SIM_TIME} ticks/window  "
+          f"BURST_BIN_MS={BURST_BIN_MS}  BURST_BIAS={BURST_BIAS}  BURST_GAIN={BURST_GAIN}  "
+          f"FC_THRESH={__import__('utils').FC_THRESH}")
     snn = build_snn()
     print(f"Built SNN: {len(snn.layers)} layers, {len(snn.connections)} connections, "
           f"output_neurons={snn.layers['output_layer'].n}")
