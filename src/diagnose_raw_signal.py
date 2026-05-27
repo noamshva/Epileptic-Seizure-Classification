@@ -41,10 +41,11 @@ NONSEIZ_MINUTE = 37                # minute containing 2220
 
 
 def bp(data, lo, hi):
+    # data shape is (n_samples, n_channels); filter along time (axis 0)
     ny = FS / 2
     b1, a1 = butter(6, hi / ny, btype="lowpass")
     b2, a2 = butter(6, lo / ny, btype="highpass")
-    return filtfilt(b2, a2, filtfilt(b1, a1, data))
+    return filtfilt(b2, a2, filtfilt(b1, a1, data, axis=0), axis=0)
 
 
 def band_powers(sig):
