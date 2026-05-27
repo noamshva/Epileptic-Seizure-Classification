@@ -78,6 +78,10 @@ def main():
 
     cache = _t._MinuteCache(capacity=2)
 
+    # Collect per-neuron spike-count vectors per window so we can compare
+    # whether the representation actually differs between classes.
+    per_neuron_vectors = {}   # label_str -> {layer_name: np.ndarray[n_neurons]}
+
     for win in probe:
         inputs, label = _t._build_window_inputs(win, cache)
         T = next(iter(inputs.values())).shape[0]
@@ -123,10 +127,33 @@ def main():
         per_neuron = out_s.sum(dim=tuple(range(out_s.ndim - 1))).long().tolist()
         print(f"  output per-neuron spike counts = {per_neuron}  (idx0=non_seizure, idx1=seizure)")
 
+        # Stash per-neuron spike-count vectors for the cross-class comparison.
+        label_str = "seizure" if label == 1 else "non_seizure"
+        per_neuron_vectors[label_str] = {}
+        for lname in ("input_layer", "hidden1_layer", "hidden2_layer", "output_layer"):
+            s = monitors[lname].get("s")
+            vec = s.sum(dim=tuple(range(s.ndim - 1))).float().cpu().numpy()
+            per_neuron_vectors[label_str][lname] = vec
+
         for lname in list(snn.monitors.keys()):
             if lname.startswith("diag_"):
                 del snn.monitors[lname]
         snn.reset_state_variables()
+
+    # ---- Cross-class representation comparison -----------------------------
+    if "seizure" in per_neuron_vectors and "non_seizure" in per_neuron_vectors:
+        print("\n=== Representation discrimination (seizure vs non-seizure) ===")
+        print("  cosine=1.0 & L1=0 → identical pattern (no signal for the classifier)")
+        print("  lower cosine / higher L1 → the layer encodes a class difference\n")
+        for lname in ("input_layer", "hidden1_layer", "hidden2_layer", "output_layer"):
+            a = per_neuron_vectors["seizure"][lname]
+            b = per_neuron_vectors["non_seizure"][lname]
+            denom = (np.linalg.norm(a) * np.linalg.norm(b))
+            cos = float(np.dot(a, b) / denom) if denom > 0 else float("nan")
+            l1 = float(np.abs(a - b).sum())
+            l1_rel = l1 / (np.abs(a).sum() + np.abs(b).sum() + 1e-9)
+            print(f"  {lname:14s} cosine={cos:.4f}  L1={l1:>10.1f}  "
+                  f"relL1={l1_rel:.3f}")
 
 
 if __name__ == "__main__":
