@@ -73,13 +73,17 @@ clk_resonators = {
         10.5, 11.5, 12.8,
         # Beta (14-32): 6 resonators
         16.6, 19.4, 22.0, 24.8, 28.4, 30.5,
-        # Gamma (32-62): 7 resonators
-        34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2,
+        # Gamma (32-62): unused by features.py; disabled to save encode time.
+        # 34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2,
     ],
 }
 
 SUBJECTS = ["chb01"]              # [] → process all subjects in CHBMIT_ROOT
-EDF_WHITELIST = ["chb01_03.edf"]  # [] → include all EDF files under each subject
+# All 7 seizure-bearing recordings of chb01 (already-encoded files are skipped).
+EDF_WHITELIST = [
+    "chb01_03.edf", "chb01_04.edf", "chb01_15.edf", "chb01_16.edf",
+    "chb01_18.edf", "chb01_21.edf", "chb01_26.edf",
+]
 
 # ======== SEIZURE-AWARE MINUTE SELECTION ========
 # - Encode every minute that contains any seizure activity ("seizure" pool).
@@ -95,6 +99,10 @@ SAMPLING_SEED = 42                # determinism for non-seizure subsampling
 # Labels are assigned per window based on overlap with seizure intervals.
 WINDOW_SECONDS = 2.0
 WINDOW_OVERLAP = 0.5
+
+# Channels encoded together per process pool. >1 overlaps channels to saturate
+# all cores; capped to keep peak RAM safe on a 16 GB machine.
+CHANNELS_PER_BATCH = 2
 
 # ======== BIPOLAR CHANNEL SELECTION ========
 # 10-channel set used for verification on the sa-aligned branch.
@@ -193,6 +201,32 @@ def _run_one_resonator(args):
 
     dur = time.time() - start_t
     return (clk_freq, f0, ch_name, wrote, dur)
+
+
+def _resample_channel(ch_data, minute_labels, n_samples):
+    """{clk_freq: {(label, minute): resampled_signal}} for one channel.
+
+    Per-minute peak-normalised then resampled to each clock rate.
+    """
+    resampled_by_clk = {}
+    for clk_freq in clk_resonators.keys():
+        resampled_by_minute = {}
+        for label, minute_list in minute_labels.items():
+            for minute in minute_list:
+                start_sample = fs * 60 * minute
+                stop_sample = min(fs * 60 * (minute + 1), n_samples)
+                if stop_sample <= start_sample:
+                    continue
+                seg = ch_data[start_sample:stop_sample]
+                seg_peak = np.max(np.abs(seg))
+                if seg_peak > 0:
+                    seg = seg / seg_peak
+                rs = resample_signal(clk_freq, fs, seg)
+                if rs.size > 0:
+                    resampled_by_minute[(label, minute)] = rs
+        if resampled_by_minute:
+            resampled_by_clk[clk_freq] = resampled_by_minute
+    return resampled_by_clk
 
 # ============================================================
 #            CHB-MIT: SUMMARY & EDF PARSING
@@ -450,91 +484,50 @@ def process_file(subject: str,
     n_non = len(minute_labels.get("non_seizure", []))
     print(f"\n>>> {subject}/{edf_file} | samples={n_samples:,} | minutes: seizure={n_seiz} non_seizure={n_non}")
 
-    for ch in df.columns:
-        ch_data = df[ch].values
-        print(f"  [Channel] {ch}")
+    # Encode channels in batches so the process pool stays saturated: each
+    # channel yields only ~9-19 fast-clock jobs, fewer than the core count, so
+    # running one channel at a time leaves cores idle. Jobs stay per
+    # (channel, clk, f0) — one resonator processes all its minutes in order,
+    # carrying membrane state across minutes exactly as the serial code did.
+    maxw = max(1, (os.cpu_count() or 2) - 1)
+    channels = list(df.columns)
 
-        # Prepare resampled data for ALL clock frequencies, per MINUTE
-        resampled_by_clk = {}
-        for clk_freq in clk_resonators.keys():
-            resampled_by_minute = {}
-            for label, minute_list in minute_labels.items():
-                for minute in minute_list:
-                    # Extract 60-second segment for this minute
-                    start_sample = fs * 60 * minute
-                    stop_sample = min(fs * 60 * (minute + 1), n_samples)
-                    if stop_sample <= start_sample:
-                        continue
-                    seg = ch_data[start_sample:stop_sample]
+    for b in range(0, len(channels), CHANNELS_PER_BATCH):
+        batch = channels[b:b + CHANNELS_PER_BATCH]
+        print(f"  [Channels] {batch}")
 
-                    # SA NORMALIZATION: Normalize per-minute to [-1, 1]
-                    # This preserves relative frequency content within the minute
-                    seg_peak = np.max(np.abs(seg))
-                    if seg_peak > 0:
-                        seg = seg / seg_peak
-
-                    # Resample to clock frequency
-                    rs = resample_signal(clk_freq, fs, seg)
-                    if rs.size > 0:
-                        resampled_by_minute[(label, minute)] = rs
-
-            if len(resampled_by_minute) > 0:
-                resampled_by_clk[clk_freq] = resampled_by_minute
-
-        # Process ALL clock frequencies in parallel
-        maxw = max(1, (os.cpu_count() or 2) - 1)
+        resampled = {
+            ch: _resample_channel(df[ch].values, minute_labels, n_samples)
+            for ch in batch
+        }
 
         with ProcessPoolExecutor(max_workers=maxw) as ex:
-            all_futures = []
-            clk_info = {}  # Track metadata for each clk_freq
+            futs = {}
+            for ch in batch:
+                for clk_freq, resonators in clk_resonators.items():
+                    rbm = resampled[ch].get(clk_freq)
+                    if rbm is None:
+                        continue
+                    for f0 in resonators:
+                        fut = ex.submit(
+                            _run_one_resonator,
+                            (subject, edf_file, ch, clk_freq, f0, rbm, SPIKES_ROOT),
+                        )
+                        futs[fut] = (ch, clk_freq, f0)
 
-            # Submit ALL f0 resonators across ALL clock frequencies
-            for clk_freq, resonators in clk_resonators.items():
-                if clk_freq not in resampled_by_clk:
-                    print(f"    clk={clk_freq:>6} Hz | no usable minutes after resample; skipping.")
-                    continue
+            total = len(futs)
+            done = wrote_total = 0
+            t0 = time.time()
+            for fut in as_completed(futs):
+                _, _, _, wrote, _ = fut.result()
+                done += 1
+                wrote_total += wrote
+                if done % log_every == 0 or done == total:
+                    el = time.time() - t0
+                    print(f"    {done:>3}/{total} resonators | wrote {wrote_total} | "
+                          f"{el:6.1f}s elapsed")
 
-                resampled_by_minute = resampled_by_clk[clk_freq]
-                n_minutes = len(resampled_by_minute)
-                total_f0 = len(resonators)
-
-                clk_info[clk_freq] = {
-                    'total_f0': total_f0,
-                    'done': 0,
-                    'wrote_total': 0,
-                    't0': time.time()
-                }
-
-                print(f"    clk={clk_freq:>6} Hz | minutes_resampled={n_minutes} | f0_count={total_f0}")
-
-                for f0 in resonators:
-                    args = (
-                        subject, edf_file, ch, clk_freq, f0,
-                        resampled_by_minute,
-                        SPIKES_ROOT,
-                    )
-                    fut = ex.submit(_run_one_resonator, args)
-                    all_futures.append((fut, clk_freq))
-
-            # Process results as they complete
-            for fut, clk_freq in all_futures:
-                clk_done, f0_done, ch_done, wrote, dur = fut.result()
-
-                info = clk_info[clk_freq]
-                info['done'] += 1
-                info['wrote_total'] += wrote
-
-                # Log progress for this clock frequency
-                if (info['done'] % log_every == 0) or (info['done'] == info['total_f0']):
-                    elapsed = time.time() - info['t0']
-                    rate = info['done'] / elapsed if elapsed > 0 else 0.0
-                    print(f"      [clk={clk_freq:>6} Hz] f0 {info['done']:>2}/{info['total_f0']} "
-                          f"(last={f0_done:>5.2f} Hz, wrote {wrote} files) | "
-                          f"elapsed {elapsed:5.1f}s | {rate:4.2f} f0/s")
-
-        # Print completion summary for all clock frequencies
-        for clk_freq in clk_info:
-            print(f"    [OK] clk={clk_freq:>6} Hz done | wrote_files={clk_info[clk_freq]['wrote_total']}")
+        del resampled
         print()
 
 
