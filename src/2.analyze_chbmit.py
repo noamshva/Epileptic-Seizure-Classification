@@ -229,13 +229,16 @@ def spikes_event_spectrogram(clk_freq: int, events: np.ndarray, window_ms: int,
 
 
 def events_to_max_spectrogram(resonators_by_clk: Dict[int, List[np.ndarray]],
-                              duration_s: int) -> np.ndarray:
+                              duration_s: int, *, bin_ms: int = 100) -> np.ndarray:
     """SA-paper Figure 4 helper: bin each resonator's events at 10 ms, then
-    downsample to 100 ms bins via max-pool. Returns (n_resonators, n_bins).
+    downsample to `bin_ms` bins via max-pool. Returns (n_resonators, n_bins).
+
+    `bin_ms=100` (default) reproduces the paper figure; `bin_ms=1000` matches
+    the FFT plot's 1-s column width for apples-to-apples side-by-side viewing.
     """
     spikes_array = sum(resonators_by_clk.values(), start=[])
     n_resonators = len(spikes_array)
-    n_bins = (duration_s * 1000) // 100         # 100 ms per output bin
+    n_bins = max(1, (duration_s * 1000) // bin_ms)
     out = np.zeros((n_resonators, n_bins))
     i = 0
     for clk_freq, events_list in resonators_by_clk.items():
@@ -509,17 +512,34 @@ def plot_sctn_one_resonator(subject: str, edf_stem: str, minute_label: str,
     y_density = np.convolve(spikes.astype(np.float32),
                             np.ones(500, dtype=np.float32), "valid")
 
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
     fig, axs = plt.subplots(2, 1, figsize=(14, 6))
     axs[0].plot(np.linspace(0, duration, len(y_density)), y_density)
+    axs[0].set_xlim(0, duration)              # match imshow's edge-to-edge extent below
     axs[0].set_title(f"Spike density (500-tick convolution) — {channel} f0={f0} Hz, {minute_label} minute {minute}")
     axs[0].set_xlabel("Time (s)")
     axs[0].set_ylabel("Spikes / 500-tick window")
 
     binned = spikes_event_spectrogram(clk, events, window_ms=1000, duration_s=duration)
+    # Disable plot_bins' own colorbar (it shrinks the axis) and attach the
+    # colorbar via make_axes_locatable so the upper and lower panels keep
+    # identical plot widths.
     plot_bins(binned[None, :], duration, labels=[f"{f0:.2f} Hz"],
-              ax=axs[1], fig=fig, colorbar=True)
+              ax=axs[1], fig=fig, colorbar=False)
     axs[1].set_title("Spikes in 1-s bins")
     axs[1].set_xlabel("Time (s)")
+
+    # Same right-side cutout on the top panel — invisible spacer — so both
+    # subplots end up with matching x-axis extents.
+    top_div = make_axes_locatable(axs[0])
+    spacer = top_div.append_axes("right", size="2%", pad=0.1)
+    spacer.set_visible(False)
+
+    bot_div = make_axes_locatable(axs[1])
+    cax = bot_div.append_axes("right", size="2%", pad=0.1)
+    fig.colorbar(axs[1].images[0], cax=cax).set_ticks([])
+
     fig.tight_layout()
     fig.savefig(FIG_DIR / "03_sctn_one_resonator.png", dpi=FIG_DPI)
     plt.close(fig)
@@ -527,8 +547,18 @@ def plot_sctn_one_resonator(subject: str, edf_stem: str, minute_label: str,
 
 def plot_fft_vs_sctn_bands(df: pd.DataFrame, channel: str,
                            subject: str, edf_stem: str,
-                           minute_label: str, minute: int) -> None:
-    """Paper Figure 4: top = FFT band bins, bottom = SCTN band spikegram, same minute."""
+                           minute_label: str, minute: int,
+                           *,
+                           sctn_bin_ms: int = 100,
+                           out_name: str = "04_fft_vs_sctn_bands.png") -> None:
+    """Paper Figure 4: top = FFT band bins, bottom = SCTN band spikegram, same minute.
+
+    `sctn_bin_ms` controls the SCTN time-bin width.
+        * 100 ms (default) reproduces the SA-paper figure — the SCTN side
+          shows finer time structure than the 1-s FFT side.
+        * 1000 ms forces both panels to the same column width for a strict
+          apples-to-apples comparison.
+    """
     t_start_s = minute * 60
     t_end_s = (minute + 1) * 60
     duration = t_end_s - t_start_s
@@ -550,22 +580,124 @@ def plot_fft_vs_sctn_bands(df: pd.DataFrame, channel: str,
             arrs.append(spikes_to_events(spikes))
         if arrs:
             resonators_by_clk[clk] = arrs
-    max_spec = events_to_max_spectrogram(resonators_by_clk, duration_s=duration)
+    max_spec = events_to_max_spectrogram(resonators_by_clk, duration_s=duration,
+                                         bin_ms=sctn_bin_ms)
     sctn_bands = spikes_to_bands(max_spec, FULL_RESONATOR_FREQS, normalize_band=False)
 
     labels = [f"{lf}-{hf} ({band})" for band, (lf, hf) in BANDS.items()]
 
     fig, axs = plt.subplots(2, 1, figsize=(14, 10))
     plot_bins(fft_bins, duration, labels, ax=axs[0], fig=fig, colorbar=True)
-    axs[0].set_title("(a) FFT band spectrogram", fontsize=18)
+    axs[0].set_title(f"(a) FFT band spectrogram (1-s bins)", fontsize=18)
     axs[0].set_ylabel("Band")
     plot_bins(sctn_bands, duration, labels, ax=axs[1], fig=fig, colorbar=True)
-    axs[1].set_title("(b) SCTN spikegram", fontsize=18)
+    axs[1].set_title(f"(b) SCTN spikegram ({sctn_bin_ms}-ms bins)", fontsize=18)
     axs[1].set_xlabel("Time (s)")
     axs[1].set_ylabel("Band")
     fig.suptitle(f"{channel} — {minute_label} minute {minute}", fontsize=14)
     fig.tight_layout()
-    fig.savefig(FIG_DIR / "04_fft_vs_sctn_bands.png", dpi=FIG_DPI)
+    fig.savefig(FIG_DIR / out_name, dpi=FIG_DPI)
+    plt.close(fig)
+
+
+def plot_selected_3x2_fft_vs_sctn(
+    df: pd.DataFrame, subject: str, edf_stem: str,
+    minute_label: str, minute: int,
+    channels: List[str],
+    *,
+    sctn_bin_ms: int = 1000,
+    out_name: str = "04c_fft_vs_sctn_3channels.png",
+) -> None:
+    """3 (channels) × 2 (FFT, SCTN) grid of band-binned heatmaps for one minute.
+
+    Each row = one channel; left column is the FFT band spectrogram, right
+    column is the SCTN band spikegram. Both columns use the same time-bin
+    width (`sctn_bin_ms`, default 1 000 ms) so the comparison is column-aligned.
+
+    A separate colour scale per column keeps each pipeline's dynamic range
+    interpretable (FFT band-power and SCTN spike-count are in different units).
+    """
+    t_start_s = minute * 60
+    t_end_s = (minute + 1) * 60
+    duration = t_end_s - t_start_s
+
+    # --- FFT side: per-channel band bins at 1-s columns ---------------------
+    fft_per_ch: Dict[str, np.ndarray] = {}
+    for ch in channels:
+        if ch not in df.columns:
+            continue
+        sliced = df[ch].values[t_start_s * FS: t_end_s * FS]
+        Sxx = plot_spectrogram(sliced, channel_name=ch, fs=FS,
+                               fmin=0.5, fmax=64, show=False)
+        fft_per_ch[ch] = fft_spectrogram_to_bins(Sxx, window=1, normalize_band=False)
+
+    # --- SCTN side: per-channel band spikegram at the requested bin width ---
+    sctn_per_ch: Dict[str, np.ndarray] = {}
+    for ch in channels:
+        resonators_by_clk: Dict[int, List[np.ndarray]] = {}
+        for clk, freqs in CLK_RESONATORS.items():
+            arrs = []
+            for f0 in freqs:
+                try:
+                    spikes = load_spike_train(subject, edf_stem, minute_label,
+                                              minute, ch, clk, f0)
+                except FileNotFoundError:
+                    continue
+                arrs.append(spikes_to_events(spikes))
+            if arrs:
+                resonators_by_clk[clk] = arrs
+        if not resonators_by_clk:
+            continue
+        max_spec = events_to_max_spectrogram(resonators_by_clk, duration_s=duration,
+                                             bin_ms=sctn_bin_ms)
+        sctn_per_ch[ch] = spikes_to_bands(max_spec, FULL_RESONATOR_FREQS,
+                                          normalize_band=False)
+
+    # --- Layout ------------------------------------------------------------
+    fft_vmax  = max((s.max() for s in fft_per_ch.values()),  default=1.0)
+    sctn_vmax = max((s.max() for s in sctn_per_ch.values()), default=1.0)
+    labels = [f"{lf}-{hf} ({band})" for band, (lf, hf) in BANDS.items()]
+
+    nrows, ncols = len(channels), 2
+    fig, axs = plt.subplots(nrows, ncols, figsize=(14, 2.9 * nrows))
+    if nrows == 1:
+        axs = np.array([axs])
+
+    for r, ch in enumerate(channels):
+        ax_fft = axs[r, 0]
+        ax_sctn = axs[r, 1]
+
+        if ch in fft_per_ch:
+            plot_bins(fft_per_ch[ch], duration, labels,
+                      ax=ax_fft, fig=None, colorbar=False, gridlines=True,
+                      vmin=0, vmax=fft_vmax, fontsize=8)
+        else:
+            ax_fft.set_visible(False)
+
+        if ch in sctn_per_ch:
+            plot_bins(sctn_per_ch[ch], duration, [""] * len(BANDS),
+                      ax=ax_sctn, fig=None, colorbar=False, gridlines=True,
+                      vmin=0, vmax=sctn_vmax, fontsize=8)
+        else:
+            ax_sctn.set_visible(False)
+
+        # Row label = channel name, on the left of the FFT panel
+        ax_fft.set_ylabel(ch, fontsize=11, fontweight="bold", rotation=90,
+                          labelpad=10)
+        # Only bottom row gets an x-axis label
+        if r == nrows - 1:
+            ax_fft.set_xlabel("Time (s)")
+            ax_sctn.set_xlabel("Time (s)")
+
+    # Column headers
+    axs[0, 0].set_title("FFT band spectrogram", fontsize=14, pad=8)
+    axs[0, 1].set_title("SCTN spikegram", fontsize=14, pad=8)
+
+    state_label = {"seizure": "Seizure",
+                   "non_seizure": "Non-seizure"}.get(minute_label, minute_label)
+    fig.suptitle(f"FFT vs SCTN — {state_label}", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(FIG_DIR / out_name, dpi=FIG_DPI)
     plt.close(fig)
 
 
@@ -896,6 +1028,28 @@ def main():
     log.info("[4/9] FFT vs SCTN band spectrograms (paper Figure 4)")
     plot_fft_vs_sctn_bands(df, primary_channel, SUBJECT, EDF_STEM,
                            "seizure", SEIZURE_MINUTE)
+
+    log.info("[4b/9] FFT vs SCTN band spectrograms — T8-P8, 1-s bins")
+    plot_fft_vs_sctn_bands(df, "T8-P8", SUBJECT, EDF_STEM,
+                           "seizure", SEIZURE_MINUTE,
+                           sctn_bin_ms=1000,
+                           out_name="04b_fft_vs_sctn_bands_1s.png")
+
+    log.info("[4c/9] FFT vs SCTN — 3-channel 3x2 grid (seizure minute)")
+    plot_selected_3x2_fft_vs_sctn(
+        df, SUBJECT, EDF_STEM, "seizure", SEIZURE_MINUTE,
+        channels=["FT9-FT10", "T8-P8", "F7-T7"],
+        sctn_bin_ms=1000,
+        out_name="04c_fft_vs_sctn_3channels_seizure.png",
+    )
+
+    log.info("[4d/9] FFT vs SCTN — 3-channel 3x2 grid (non-seizure minute)")
+    plot_selected_3x2_fft_vs_sctn(
+        df, SUBJECT, EDF_STEM, "non_seizure", NON_SEIZURE_MINUTE,
+        channels=["FT9-FT10", "T8-P8", "F7-T7"],
+        sctn_bin_ms=1000,
+        out_name="04d_fft_vs_sctn_3channels_nonseizure.png",
+    )
 
     log.info("[5/9] per-channel FFT grid")
     plot_per_channel_fft(df, SEIZURE_MINUTE, "seizure", fft_per_ch=fft_seiz)
