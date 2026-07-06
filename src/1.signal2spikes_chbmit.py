@@ -78,11 +78,11 @@ clk_resonators = {
     ],
 }
 
-SUBJECTS = ["chb01"]              # [] → process all subjects in CHBMIT_ROOT
-# All 7 seizure-bearing recordings of chb01 (already-encoded files are skipped).
+SUBJECTS = ["chb02"]              # [] → process all subjects in CHBMIT_ROOT
+# Seizure-bearing recordings (already-encoded files are skipped).
+# chb01 (encoded): chb01_{03,04,15,16,18,21,26}.edf
 EDF_WHITELIST = [
-    "chb01_03.edf", "chb01_04.edf", "chb01_15.edf", "chb01_16.edf",
-    "chb01_18.edf", "chb01_21.edf", "chb01_26.edf",
+    "chb02_16.edf", "chb02_16+.edf", "chb02_19.edf",
 ]
 
 # ======== SEIZURE-AWARE MINUTE SELECTION ========
