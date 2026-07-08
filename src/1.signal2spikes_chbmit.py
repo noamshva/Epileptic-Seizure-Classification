@@ -23,6 +23,14 @@ from scipy.signal import butter, filtfilt, resample, resample_poly
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from sctn.resonator import resonator as spikes_resonator
 
+# Numba fast path (~1000x faster than the pure-Python resonator, bit-identical).
+try:
+    import sctn_fast as _sctn_fast
+    USE_FAST_KERNEL = True
+except Exception:
+    _sctn_fast = None
+    USE_FAST_KERNEL = False
+
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -73,17 +81,14 @@ clk_resonators = {
         10.5, 11.5, 12.8,
         # Beta (14-32): 6 resonators
         16.6, 19.4, 22.0, 24.8, 28.4, 30.5,
-        # Gamma (32-62): unused by features.py; disabled to save encode time.
-        # 34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2,
+        # Gamma (32-62): 7 resonators.
+        34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2,
     ],
 }
 
-SUBJECTS = ["chb02"]              # [] → process all subjects in CHBMIT_ROOT
-# Seizure-bearing recordings (already-encoded files are skipped).
-# chb01 (encoded): chb01_{03,04,15,16,18,21,26}.edf
-EDF_WHITELIST = [
-    "chb02_16.edf", "chb02_16+.edf", "chb02_19.edf",
-]
+SUBJECTS = [f"chb{n:02d}" for n in range(1, 25)]   # all CHB-MIT patients
+EDF_WHITELIST = []                # [] → all EDFs (further filtered by SEIZURE_ONLY)
+SEIZURE_ONLY = True               # when EDF_WHITELIST empty, keep only seizure recordings
 
 # ======== SEIZURE-AWARE MINUTE SELECTION ========
 # - Encode every minute that contains any seizure activity ("seizure" pool).
@@ -103,6 +108,10 @@ WINDOW_OVERLAP = 0.5
 # Channels encoded together per process pool. >1 overlaps channels to saturate
 # all cores; capped to keep peak RAM safe on a 16 GB machine.
 CHANNELS_PER_BATCH = 2
+
+# Fast-path (Numba) parallelism: encode this many recordings concurrently, each
+# in its own process. Recordings are independent, so this is a clean fan-out.
+FAST_MAX_WORKERS = min(8, max(1, (os.cpu_count() or 2) - 2))
 
 # ======== BIPOLAR CHANNEL SELECTION ========
 # 10-channel set used for verification on the sa-aligned branch.
@@ -346,14 +355,11 @@ def read_edf_channels_bipolar(edf_path: str, desired_bipolar_channels: list[str]
                 channel_mapping[avail] = desired
                 found = True
                 break
-            # Check if available channel starts with desired (handles "T8-P8-0" matching "T8-P8")
-            if avail_normalized.startswith(desired_normalized):
-                matched_channels.append(avail)
-                channel_mapping[avail] = desired
-                found = True
-                break
-            # Check if desired is contained in available (handles variations)
-            if desired_normalized in avail_normalized or avail_normalized in desired_normalized:
+            # Starts-with handles the "T8-P8-0"/"T8-P8-1" suffixed duplicates.
+            # (A looser substring match is intentionally NOT used: it maps bipolar
+            # names onto single-electrode referential montages, e.g. chb12's
+            # "FP1"/"F7", producing garbage or duplicate columns.)
+            if avail_normalized.startswith(desired_normalized) and avail not in matched_channels:
                 matched_channels.append(avail)
                 channel_mapping[avail] = desired
                 found = True
@@ -382,7 +388,10 @@ def read_edf_channels_bipolar(edf_path: str, desired_bipolar_channels: list[str]
     # Use the original desired channel names for consistency
     column_names = [channel_mapping[ch] for ch in matched_channels]
 
-    return pd.DataFrame(data, columns=column_names)
+    df = pd.DataFrame(data, columns=column_names)
+    if df.columns.duplicated().any():          # safety: never let df[ch] be 2-D
+        df = df.loc[:, ~df.columns.duplicated()]
+    return df
 
 
 def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, rng=None):
@@ -459,6 +468,55 @@ def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, 
 def resonator_fname_to_freq(name: str) -> float:
     return float(Path(name).stem)
 
+
+def _process_file_fast(subject, edf_file, df, minute_labels, n_samples, log_every=5):
+    """Numba fast path: encode all (channel, clk, f0) resonators serially via
+    sctn_fast (bit-identical to the pure-Python resonator, ~1000x faster, so no
+    process pool needed). Warms up then runs a channel's minutes in order,
+    carrying state — same contract as _run_one_resonator. Writes only missing
+    minute files."""
+    edf_base = Path(edf_file).stem
+    channels = list(df.columns)
+    total = len(channels) * sum(len(v) for v in clk_resonators.values())
+    done = wrote = 0
+    t0 = time.time()
+    order_all = [(lab, mn) for lab, lst in minute_labels.items() for mn in lst]
+    for ch in channels:
+        # Fast resume: skip resampling if every resonator file for this channel exists.
+        ch_paths = [Path(SPIKES_ROOT) / f"{subject}/{edf_base}" / lab / str(mn)
+                    / ch / str(clk_freq) / f"{f0}.npz"
+                    for clk_freq, res in clk_resonators.items() for f0 in res
+                    for (lab, mn) in order_all]
+        if ch_paths and all(p.exists() for p in ch_paths):
+            done += sum(len(v) for v in clk_resonators.values())
+            continue
+        rbclk = _resample_channel(df[ch].values, minute_labels, n_samples)
+        for clk_freq, resonators in clk_resonators.items():
+            rbm = rbclk.get(clk_freq)
+            if not rbm:
+                done += len(resonators)
+                continue
+            order = list(rbm.keys())                       # (label, minute) order
+            signals = [rbm[k] for k in order]
+            for f0 in resonators:
+                done += 1
+                paths = [Path(SPIKES_ROOT) / f"{subject}/{edf_base}" / lab / str(mn)
+                         / ch / str(clk_freq) / f"{f0}.npz" for (lab, mn) in order]
+                if all(p.exists() for p in paths):
+                    continue
+                outs = _sctn_fast.resonate_minutes(f0, clk_freq, signals, warmup_seconds=5)
+                for p, out in zip(paths, outs):
+                    if not p.exists():
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        np.savez_compressed(p, spikes=out)
+                        wrote += 1
+                if done % (log_every * 5) == 0:
+                    print(f"    {done:>4}/{total} resonators | wrote {wrote} | "
+                          f"{time.time() - t0:6.1f}s")
+    print(f"    [fast] {done}/{total} resonators | wrote {wrote} | "
+          f"{time.time() - t0:.1f}s")
+
+
 def process_file(subject: str,
                  edf_file: str,
                  desired_bipolar_channels: list[str],
@@ -483,6 +541,10 @@ def process_file(subject: str,
     n_seiz = len(minute_labels.get("seizure", []))
     n_non = len(minute_labels.get("non_seizure", []))
     print(f"\n>>> {subject}/{edf_file} | samples={n_samples:,} | minutes: seizure={n_seiz} non_seizure={n_non}")
+
+    if USE_FAST_KERNEL:
+        _process_file_fast(subject, edf_file, df, minute_labels, n_samples, log_every)
+        return
 
     # Encode channels in batches so the process pool stays saturated: each
     # channel yields only ~9-19 fast-clock jobs, fewer than the core count, so
@@ -851,40 +913,78 @@ def create_datasets(time_of_sample_s, overlap, subjects, output_path, skip_begin
 #                    MAIN DRIVER
 # ============================================================
 
+def _encode_one_recording(args):
+    """Top-level worker (picklable). Returns (subject, edf, error_or_None) so a
+    single bad recording (e.g. an incompatible montage) is skipped, not fatal."""
+    subject, edf_file, channels, seizures_by_file = args
+    try:
+        process_file(subject, edf_file, channels, seizures_by_file)
+        return (subject, edf_file, None)
+    except Exception as ex:
+        return (subject, edf_file, f"{type(ex).__name__}: {ex}")
+
+
+def _prewarm_numba():
+    """Trigger @njit compilation once in the parent so workers load from cache."""
+    if not USE_FAST_KERNEL:
+        return
+    for clk, f0 in [(15360, 2.5), (153600, 22.0)]:
+        _sctn_fast.resonate_minutes(f0, clk, [np.zeros(clk, dtype=np.float64)], warmup_seconds=0)
+
+
 def main():
     subjects = [s for s in SUBJECTS if os.path.isdir(os.path.join(CHBMIT_ROOT, s))]
     if not subjects:
         raise RuntimeError(f"No subject folders found under {CHBMIT_ROOT}")
 
+    print(f"Selected bipolar channels: {SELECT_BIPOLAR_CHANNELS}")
+
+    # Build the recording work-list across all subjects.
+    tasks = []
     for subject in subjects:
         subj_dir = os.path.join(CHBMIT_ROOT, subject)
         summary_path = os.path.join(subj_dir, f"{subject}-summary.txt")
         if not os.path.isfile(summary_path):
-            raise FileNotFoundError(f"Missing summary: {summary_path}")
-
-        sampling_rate, ch_order, seizures_by_file, ch_by_idx = parse_summary(summary_path)
-        if sampling_rate != fs:
-            print(f"Warning: summary says fs={sampling_rate} but using fs={fs}")
-
-        # Use bipolar channels directly (no reconstruction needed)
-        desired_bipolar_channels = SELECT_BIPOLAR_CHANNELS
-        if not desired_bipolar_channels:
-            raise ValueError("No bipolar channels selected. Please set SELECT_BIPOLAR_CHANNELS.")
-
-        print(f"Selected bipolar channels: {desired_bipolar_channels}")
-
-        edf_files = sorted([f for f in os.listdir(subj_dir) if f.lower().endswith(".edf")])
+            print(f"Missing summary for {subject}, skipping.")
+            continue
+        _, _, seizures_by_file, _ = parse_summary(summary_path)
+        edf_files = sorted(f for f in os.listdir(subj_dir) if f.lower().endswith(".edf"))
         if EDF_WHITELIST:
             edf_files = [f for f in edf_files if f in EDF_WHITELIST]
-        if not edf_files:
-            print(f"No EDF files for {subject}, skipping.")
-            continue
+        elif SEIZURE_ONLY:
+            edf_files = [f for f in edf_files if seizures_by_file.get(f)]
+        for edf_file in edf_files:
+            tasks.append((subject, edf_file, SELECT_BIPOLAR_CHANNELS, seizures_by_file))
 
-        total = len(edf_files) * len(desired_bipolar_channels) * sum(len(v) for v in clk_resonators.values())
-        with tqdm(total=total, desc=f"Subject {subject} (spikes)") as pbar:
-            for edf_file in edf_files:
-                process_file(subject, edf_file, desired_bipolar_channels, seizures_by_file)
-                pbar.update(1)
+    print(f"Recordings to encode: {len(tasks)} across {len(subjects)} subjects")
+    if not tasks:
+        print("Nothing to encode.")
+        return
+
+    skipped = []
+    if USE_FAST_KERNEL and len(tasks) > 1:
+        _prewarm_numba()
+        print(f"Fast path: {FAST_MAX_WORKERS} parallel workers")
+        with ProcessPoolExecutor(max_workers=FAST_MAX_WORKERS) as ex:
+            futs = {ex.submit(_encode_one_recording, t): t for t in tasks}
+            for i, fut in enumerate(as_completed(futs), 1):
+                subj, edf, err = fut.result()
+                if err:
+                    skipped.append((subj, edf, err))
+                    print(f"[{i}/{len(tasks)}] SKIPPED {subj}/{edf}: {err}", flush=True)
+                else:
+                    print(f"[{i}/{len(tasks)}] finished {subj}/{edf}", flush=True)
+    else:
+        for i, t in enumerate(tasks, 1):
+            subj, edf, err = _encode_one_recording(t)
+            if err:
+                skipped.append((subj, edf, err))
+                print(f"[{i}/{len(tasks)}] SKIPPED {subj}/{edf}: {err}", flush=True)
+
+    if skipped:
+        print(f"\n{len(skipped)} recording(s) skipped (incompatible montage / read error):")
+        for subj, edf, err in skipped:
+            print(f"  {subj}/{edf}: {err}")
 
     # Option B: training reads spikes_raw/ lazily; no need to pre-build a windowed
     # cache. Set BUILD_WINDOWED_CACHE=1 to keep the legacy behaviour (writes the
