@@ -1,33 +1,26 @@
-"""
-Seizure vs non-seizure classification on SCTN burstiness features.
+"""Seizure vs non-seizure classifier on SCTN burstiness features (SVM).
 
-This is the *classical-classifiers* branch entry point: skips the SNN
-classifier entirely and feeds the burstiness vectors from `src/features.py`
-into a scikit-learn pipeline. First classifier wired up is an SVM (RBF);
-other classifiers (RF, XGB, ...) can drop into the same harness later.
+The third stage of the pipeline: encode (1) -> analyse (2) -> classify (3).
+Feeds the burstiness vectors from features.py into a scikit-learn classifier and
+reports performance per patient with BOTH:
+  - leave-one-recording-out (LORO)  -- the honest, leakage-free score
+  - stratified 5-fold               -- reference only (optimistic: 50%-overlap
+                                       windows leak near-duplicates across folds)
 
-Usage (from project root, .venv3_11 active):
+The comprehensive cross-patient comparison / figures live in src/2.analyze; this
+file is just the classifier and its per-patient scorecard + confusion matrix.
 
-    python -u src/3.run_classify_chbmit.py
-
-Env vars:
-    FEATURE_LEVEL = band (40 features, default)  |  resonator (280 features)
-    CLASSIFIER    = svm (default)                |  (more later)
-    KERNEL        = rbf (default)                |  linear  |  poly
-    C, GAMMA      = SVC hyperparameters (defaults C=1, gamma='scale')
-    CV_FOLDS      = 5 (stratified k-fold; random shuffle, seed 0)
-    BALANCE       = 1 (use class_weight='balanced', default)  |  0
-
-Outputs go under output_data/results/.
-
-Caveat: with 50% overlap on a single EDF, random k-fold leaks adjacent
-windows across folds — treat the score as "do the features carry signal?"
-not as a final benchmark. Honest evaluation = leave-one-EDF-out (and later
-leave-one-patient-out) once more data is encoded.
+Usage:
+    python -u src/3.run_classify_chbmit.py                 # SVM, chb01
+    python -u src/3.run_classify_chbmit.py chb01 chb03     # specific patients
+Env:
+    FEATURE_LEVEL = band (default) | resonator
+    CLASSIFIER    = svm (default) | rf | gb
 """
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -35,126 +28,121 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import LeaveOneGroupOut, StratifiedKFold, cross_val_predict
 from sklearn.metrics import (
-    confusion_matrix, classification_report, roc_auc_score,
+    roc_auc_score, f1_score, accuracy_score, confusion_matrix, classification_report,
 )
 
-import features as F
-
-
-# ---------------------------------------------------------------------------
-# Configuration (env-overridable)
-# ---------------------------------------------------------------------------
-SUBJECTS = ["chb01"]
-FEATURE_LEVEL = os.environ.get("FEATURE_LEVEL", "band")
-CLASSIFIER    = os.environ.get("CLASSIFIER", "svm").lower()
-KERNEL        = os.environ.get("KERNEL", "rbf")
-C_VAL         = float(os.environ.get("C", "1.0"))
-GAMMA         = os.environ.get("GAMMA", "scale")
-CV_FOLDS      = int(os.environ.get("CV_FOLDS", "5"))
-BALANCE       = os.environ.get("BALANCE", "1") == "1"
-
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = _SCRIPT_DIR.parent
-OUT_DIR = _PROJECT_ROOT / "output_data" / "results"
+sys.path.insert(0, str(_SCRIPT_DIR))
+import features as F                                                    # noqa: E402
+
+FEATURE_LEVEL = os.environ.get("FEATURE_LEVEL", "band")
+SEED = 0
+OUT_DIR = _SCRIPT_DIR.parent / "output_data" / "results"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Classifier factory — keep the rest of the script classifier-agnostic so we
-# can add CLASSIFIER=rf / xgb later without rewriting the harness.
-# ---------------------------------------------------------------------------
 def make_classifier(name: str):
+    """Standardised pipeline for the requested classical classifier."""
+    name = name.lower()
     if name == "svm":
-        # Try to parse GAMMA as float; otherwise pass the sklearn keyword as-is.
+        clf = SVC(kernel="rbf", C=1.0, gamma="scale",
+                  class_weight="balanced", probability=True, random_state=SEED)
+    elif name == "rf":
+        clf = RandomForestClassifier(n_estimators=300, class_weight="balanced",
+                                     random_state=SEED, n_jobs=-1)
+    elif name == "gb":
+        clf = GradientBoostingClassifier(random_state=SEED)
+    else:
+        raise ValueError(f"Unknown CLASSIFIER={name!r} (svm|rf|gb)")
+    return make_pipeline(StandardScaler(), clf), name
+
+
+def _loro_pooled(pipe, X, y, g):
+    """Pooled leave-one-recording-out predictions + probabilities."""
+    logo = LeaveOneGroupOut()
+    yp = np.zeros(len(y), int)
+    ps = np.full(len(y), np.nan)
+    for tr, te in logo.split(X, y, groups=g):
+        m = pipe.fit(X[tr], y[tr])
+        yp[te] = m.predict(X[te])
+        ps[te] = m.predict_proba(X[te])[:, 1]
+    return yp, ps
+
+
+def main(classifier: str | None = None):
+    patients = [a for a in sys.argv[1:] if not a.startswith("-")] or ["chb01"]
+    name = (classifier or os.environ.get("CLASSIFIER", "svm")).lower()
+    print(f"Classifier: {name}   feature_level: {FEATURE_LEVEL}   patients: {patients}")
+
+    rows = []
+    pooled_y, pooled_pred = [], []
+    for subj in patients:
         try:
-            gamma = float(GAMMA)
-        except ValueError:
-            gamma = GAMMA
-        clf = SVC(
-            kernel=KERNEL, C=C_VAL, gamma=gamma,
-            class_weight=("balanced" if BALANCE else None),
-            probability=True,
-        )
-        return make_pipeline(StandardScaler(), clf), f"SVM-{KERNEL} (C={C_VAL}, gamma={gamma})"
-    raise ValueError(f"Unknown CLASSIFIER={name!r}. Known: svm.")
+            X, y, g, names = F.build_dataset_groups([subj], feature_level=FEATURE_LEVEL)
+        except Exception as e:
+            print(f"  {subj}: skip ({e})"); continue
+        n_rec = len(set(g.tolist()))
+        if int(y.sum()) == 0 or int(y.sum()) == len(y):
+            print(f"  {subj}: single-class, skip"); continue
 
+        pipe, _ = make_classifier(name)
+        # honest LORO
+        if n_rec >= 2:
+            yp, ps = _loro_pooled(pipe, X, y, g)
+            loro_auc = roc_auc_score(y, ps) if len(set(y.tolist())) > 1 else float("nan")
+            loro_f1 = f1_score(y, yp, zero_division=0)
+            loro_acc = accuracy_score(y, yp)
+            pooled_y.append(y); pooled_pred.append(yp)
+        else:
+            loro_auc = loro_f1 = loro_acc = float("nan"); yp = None
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main() -> None:
-    print(f"Subjects     : {SUBJECTS}")
-    print(f"Feature level: {FEATURE_LEVEL}")
-    print(f"Classifier   : {CLASSIFIER}")
-    print(f"CV folds     : {CV_FOLDS}    balanced={BALANCE}")
+        # stratified reference
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+        pipe_s, _ = make_classifier(name)
+        sp = cross_val_predict(pipe_s, X, y, cv=cv, method="predict_proba")[:, 1]
+        strat_auc = roc_auc_score(y, sp)
 
-    X, y, names = F.build_dataset(SUBJECTS, feature_level=FEATURE_LEVEL)
-    n_seiz = int(y.sum())
-    print(f"Dataset      : {X.shape[0]} windows x {X.shape[1]} features "
-          f"({n_seiz} seizure, {len(y) - n_seiz} non-seizure)")
-    if n_seiz == 0 or n_seiz == len(y):
-        raise RuntimeError("Dataset has only one class — check encoder output / channel selection.")
+        rows.append({"patient": subj, "n_rec": n_rec, "n_win": len(y),
+                     "seizure": int(y.sum()), "loro_auc": loro_auc, "loro_f1": loro_f1,
+                     "loro_acc": loro_acc, "stratified_auc": strat_auc})
+        print(f"  {subj}: LORO AUC={loro_auc:.3f} F1={loro_f1:.3f} | "
+              f"stratified AUC={strat_auc:.3f}")
 
-    pipe, label = make_classifier(CLASSIFIER)
+    if not rows:
+        print("No patients classified."); return
+    df = pd.DataFrame(rows)
+    rep_csv = OUT_DIR / f"{name}_classifier_report.csv"
+    df.to_csv(rep_csv, index=False)
+    print(f"\nMean LORO AUC (patients with >=2 recordings): "
+          f"{df['loro_auc'].mean(skipna=True):.3f}")
 
-    cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=0)
-    y_pred = cross_val_predict(pipe, X, y, cv=cv)
-    y_score = cross_val_predict(pipe, X, y, cv=cv, method="predict_proba")[:, 1]
-
-    cm = confusion_matrix(y, y_pred, labels=[0, 1])
-    report = classification_report(
-        y, y_pred, target_names=["non_seizure", "seizure"],
-        output_dict=True, zero_division=0,
-    )
-    try:
-        auc = roc_auc_score(y, y_score)
-    except ValueError:
-        auc = float("nan")
-
-    print(f"\n=== {CV_FOLDS}-fold CV results ({label}) ===")
-    print(pd.DataFrame(report).T.round(3).to_string())
-    print(f"\nROC AUC: {auc:.3f}")
-    print(f"Confusion matrix [rows=true, cols=pred]  (0=non,1=seiz):\n{cm}")
-    print("\nCaveat: 50%-overlap windows from one EDF -> random CV leaks somewhat.")
-    print("Treat as a 'does the feature carry signal' check, not a final score.")
-
-    # Top discriminative features (standardized seizure-vs-non difference).
-    seiz_mean = X[y == 1].mean(axis=0)
-    non_mean = X[y == 0].mean(axis=0)
-    pooled_std = X.std(axis=0) + 1e-9
-    effect = np.abs(seiz_mean - non_mean) / pooled_std
-    order = np.argsort(effect)[::-1][:15]
-    print("\nTop 15 discriminative features (standardized seizure-non difference):")
-    for i in order:
-        print(f"  {names[i]:24s} effect={effect[i]:.3f}  "
-              f"seiz={seiz_mean[i]:.3f} non={non_mean[i]:.3f}")
-
-    # Persist results.
-    report_csv = OUT_DIR / f"{CLASSIFIER}_report.csv"
-    cm_png = OUT_DIR / f"{CLASSIFIER}_confusion_matrix.png"
-    pd.DataFrame(report).T.to_csv(report_csv)
-
-    plt.figure(figsize=(4, 4))
-    sns.heatmap(
-        cm, annot=True, fmt="d", cmap="Blues",
-        xticklabels=["Non-Seizure", "Seizure"],
-        yticklabels=["Non-Seizure", "Seizure"],
-    )
-    plt.xlabel("Predicted"); plt.ylabel("True")
-    plt.title(f"{label}\n[{FEATURE_LEVEL} features]   AUC={auc:.3f}")
-    plt.tight_layout()
-    plt.savefig(cm_png, dpi=150)
-    plt.close()
-
-    print(f"\nSaved: {report_csv}")
-    print(f"Saved: {cm_png}")
+    # pooled confusion matrix (honest LORO)
+    if pooled_y:
+        yy = np.concatenate(pooled_y); pp = np.concatenate(pooled_pred)
+        cm = confusion_matrix(yy, pp, labels=[0, 1])
+        print("\nPooled LORO classification report:")
+        print(classification_report(yy, pp, target_names=["non_seizure", "seizure"],
+                                    zero_division=0))
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.imshow(cm, cmap="Blues")
+        for (i, j), v in np.ndenumerate(cm):
+            ax.text(j, i, str(v), ha="center", va="center",
+                    color="white" if v > cm.max() / 2 else "black", fontsize=13)
+        ax.set_xticks([0, 1]); ax.set_xticklabels(["Non-seizure", "Seizure"])
+        ax.set_yticks([0, 1]); ax.set_yticklabels(["Non-seizure", "Seizure"])
+        ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+        ax.set_title(f"{name.upper()} — pooled LORO confusion")
+        fig.tight_layout()
+        cm_png = OUT_DIR / f"{name}_confusion_matrix.png"
+        fig.savefig(cm_png, dpi=150); plt.close(fig)
+        print(f"Saved: {rep_csv}\n       {cm_png}")
 
 
 if __name__ == "__main__":
