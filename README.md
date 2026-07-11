@@ -1,5 +1,7 @@
 # Epileptic-Seizure-Classification
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/noamshva/Epileptic-Seizure-Classification/blob/main/src/run_pipeline.ipynb)
+
 Seizure vs. non-seizure classification from CHB-MIT scalp EEG using a
 **neuromorphic SCTN resonator front-end** (Spike Continuous-Time Neurons)
 instead of classical FFT band-power features, classified by standard machine
@@ -63,9 +65,11 @@ must contain `dataset/chbmit/` and `dataset/spikes_raw/`.
 
 ## Running
 
-**Notebook (recommended, local or Colab):** open [src/run_pipeline.ipynb](src/run_pipeline.ipynb),
-set `DATA_ROOT` in the Config cell, run all cells. It auto-discovers encoded
-patients: analysis illustrates one subject; encoding + classification run on all.
+**Notebook (recommended, local or Colab):** open [src/run_pipeline.ipynb](src/run_pipeline.ipynb) —
+or click the **Open in Colab** badge above (opens straight from GitHub; run the
+Setup cell to clone + mount Drive). Set `DATA_ROOT` in the Config cell, run all
+cells. It auto-discovers encoded patients: analysis illustrates one subject;
+encoding + classification run on all.
 
 **Command line:**
 
