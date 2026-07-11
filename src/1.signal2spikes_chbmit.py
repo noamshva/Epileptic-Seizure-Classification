@@ -90,6 +90,10 @@ SUBJECTS = [f"chb{n:02d}" for n in range(1, 25)]   # all CHB-MIT patients
 EDF_WHITELIST = []                # [] → all EDFs (further filtered by SEIZURE_ONLY)
 SEIZURE_ONLY = True               # when EDF_WHITELIST empty, keep only seizure recordings
 
+# Notebook/CLI override: PIPELINE_SUBJECTS="chb01,chb02" scopes the run.
+if os.environ.get("PIPELINE_SUBJECTS"):
+    SUBJECTS = [s.strip() for s in os.environ["PIPELINE_SUBJECTS"].split(",") if s.strip()]
+
 # ======== SEIZURE-AWARE MINUTE SELECTION ========
 # - Encode every minute that contains any seizure activity ("seizure" pool).
 # - Encode a subsampled set of minutes that are >= GUARD_SECONDS from every

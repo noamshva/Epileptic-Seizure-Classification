@@ -90,12 +90,12 @@ def _setup_logger() -> logging.Logger:
 
 log = _setup_logger()
 
-# What to analyze
-SUBJECT = "chb01"
-EDF_FILE = "chb01_03.edf"
-EDF_STEM = "chb01_03"
-SEIZURE_MINUTE = 49           # minute that contains the seizure (sec 2940-3000 → seizure at 2996-3036)
-NON_SEIZURE_MINUTE = 4        # interictal minute (>= 5 min from seizure)
+# What to analyze (env-overridable so the pipeline notebook can retarget it)
+SUBJECT = os.environ.get("PIPELINE_SUBJECT", "chb01")
+EDF_FILE = os.environ.get("PIPELINE_EDF", "chb01_03.edf")
+EDF_STEM = EDF_FILE[:-4] if EDF_FILE.endswith(".edf") else EDF_FILE
+SEIZURE_MINUTE = int(os.environ.get("PIPELINE_SEIZURE_MIN", "49"))       # minute containing the seizure
+NON_SEIZURE_MINUTE = int(os.environ.get("PIPELINE_NONSEIZURE_MIN", "4")) # interictal minute (>= 5 min away)
 
 # Bipolar channels — must match the 10 channels in 1.signal2spikes_chbmit.py
 CHANNELS = [
