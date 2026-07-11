@@ -62,11 +62,14 @@ for _stream in (sys.stdout, sys.stderr):
 # ============================================================
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
+# Data + outputs live under PIPELINE_DATA_ROOT if set (e.g. a Drive folder in
+# Colab), else under the repo.
+_DATA_ROOT = Path(os.environ.get("PIPELINE_DATA_ROOT", str(_PROJECT_ROOT)))
 
-CHBMIT_ROOT = _PROJECT_ROOT / "dataset" / "chbmit"
-SPIKES_ROOT = _PROJECT_ROOT / "dataset" / "spikes_raw"
-FIG_DIR = _PROJECT_ROOT / "analysis" / "figures"
-STATS_DIR = _PROJECT_ROOT / "analysis" / "stats"
+CHBMIT_ROOT = _DATA_ROOT / "dataset" / "chbmit"
+SPIKES_ROOT = _DATA_ROOT / "dataset" / "spikes_raw"
+FIG_DIR = _DATA_ROOT / "analysis" / "figures"
+STATS_DIR = _DATA_ROOT / "analysis" / "stats"
 FIG_DIR.mkdir(parents=True, exist_ok=True)
 STATS_DIR.mkdir(parents=True, exist_ok=True)
 

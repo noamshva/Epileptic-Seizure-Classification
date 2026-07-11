@@ -44,7 +44,9 @@ import features as F                                                    # noqa: 
 
 FEATURE_LEVEL = os.environ.get("FEATURE_LEVEL", "band")
 SEED = 0
-OUT_DIR = _SCRIPT_DIR.parent / "output_data" / "results"
+# Outputs land under PIPELINE_DATA_ROOT if set (e.g. Drive in Colab), else the repo.
+_OUT_ROOT = Path(os.environ.get("PIPELINE_DATA_ROOT", str(_SCRIPT_DIR.parent)))
+OUT_DIR = _OUT_ROOT / "output_data" / "results"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 

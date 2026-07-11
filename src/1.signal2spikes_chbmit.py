@@ -47,10 +47,13 @@ from pathlib import Path as _Path
 
 _script_dir = _Path(__file__).parent
 _project_root = _script_dir.parent
+# Data lives under PIPELINE_DATA_ROOT if set (e.g. a Google Drive folder in Colab),
+# else under the repo. Must contain dataset/chbmit and dataset/spikes_raw.
+_data_root = _Path(_os.environ.get("PIPELINE_DATA_ROOT", str(_project_root)))
 
-CHBMIT_ROOT = str(_project_root / "dataset" / "chbmit")
-SPIKES_ROOT = str(_project_root / "dataset" / "spikes_raw")
-OUTPUT_PATH = str(_project_root / "dataset" / "spikes_windowed")
+CHBMIT_ROOT = str(_data_root / "dataset" / "chbmit")
+SPIKES_ROOT = str(_data_root / "dataset" / "spikes_raw")
+OUTPUT_PATH = str(_data_root / "dataset" / "spikes_windowed")
 
 fs = 256  # Hz
 
