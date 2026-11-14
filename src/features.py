@@ -73,6 +73,23 @@ BAND_RESONATORS = {
 GAMMA_RESONATORS = [34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2]
 
 
+CACHE_ROOT = Path(SPIKES_ROOT).parent / "features_cache"
+
+
+def cache_path(subject: str) -> Path:
+    return CACHE_ROOT / f"{subject}.npz"
+
+
+def load_cached(subject: str, feature_level: str = "band"):
+    """(X, y, groups) from the cache written by cache_features.py."""
+    p = cache_path(subject)
+    if not p.is_file():
+        raise FileNotFoundError(f"{p} missing; run src/cache_features.py {subject}")
+    d = np.load(p)
+    X = d["X_band"] if feature_level == "band" else d["X_res"]
+    return X.astype(np.float64), d["y"].astype(int), d["groups"]
+
+
 def _bands_and_resonators(include_gamma: bool):
     """(bands tuple, {band: [f0]}) with Gamma optionally appended."""
     if not include_gamma:
