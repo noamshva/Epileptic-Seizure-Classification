@@ -90,6 +90,18 @@ def load_cached(subject: str, feature_level: str = "band"):
     return X.astype(np.float64), d["y"].astype(int), d["groups"]
 
 
+BINS_ROOT = Path(SPIKES_ROOT).parent / "bins_cache"
+
+
+def load_bins(subject: str):
+    """(X int16 [n, N_BINS, 280], y, groups) from cache_features.py --bins."""
+    p = BINS_ROOT / f"{subject}.npz"
+    if not p.is_file():
+        raise FileNotFoundError(f"{p} missing; run src/cache_features.py --bins {subject}")
+    d = np.load(p)
+    return d["X_bins"], d["y"].astype(int), d["groups"]
+
+
 def _bands_and_resonators(include_gamma: bool):
     """(bands tuple, {band: [f0]}) with Gamma optionally appended."""
     if not include_gamma:
@@ -105,6 +117,7 @@ def _clk_of(f0: float) -> int:
 # Burstiness configuration.
 # ---------------------------------------------------------------------------
 BURST_BIN_MS = 10.0          # local-density bin width for burstiness
+N_BINS = int(WINDOW_SECONDS * 1000 / BURST_BIN_MS)
 
 
 def _binned_density(spike_arr: np.ndarray, clk: int) -> np.ndarray:
@@ -207,6 +220,23 @@ def window_burstiness(win_desc, cache: MinuteCache) -> dict[tuple[str, str], np.
 
 # Backwards-compatible alias.
 _window_burstiness = window_burstiness
+
+
+def window_bins(win_desc, cache: MinuteCache) -> dict[tuple[str, str], list[np.ndarray]]:
+    """dict[(ch, band)] -> per-resonator BURST_BIN_MS spike counts over the window."""
+    minute_data = cache.get(
+        win_desc["subject"], win_desc["trial"],
+        win_desc["minute_label"], win_desc["minute"],
+    )
+    sec_offset = win_desc["sec_offset_in_minute"]
+    out: dict[tuple[str, str], list[np.ndarray]] = {}
+    for (ch, band), per_res in minute_data.items():
+        rows = []
+        for clk, arr in per_res:
+            start = int(round(sec_offset * clk))
+            rows.append(_binned_density(arr[start:start + int(round(WINDOW_SECONDS * clk))], clk))
+        out[(ch, band)] = rows
+    return out
 
 
 def iter_window_features(

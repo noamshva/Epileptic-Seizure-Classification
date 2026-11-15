@@ -10,9 +10,14 @@ Writes <data root>/dataset/features_cache/<subject>.npz with:
     groups  [n]       recording (trial) of each window, for LORO
     start_s [n]       window start within the recording
 
+With --bins it instead writes <data root>/dataset/bins_cache/<subject>.npz with:
+    X_bins  [n, 200, 280] int16  10-ms spike counts per resonator
+    y, groups, start_s           as above
+
 Usage:
     python -u src/cache_features.py                # all encoded patients
     python -u src/cache_features.py chb01 chb03
+    python -u src/cache_features.py --bins
 """
 from __future__ import annotations
 
@@ -62,15 +67,50 @@ def cache_subject(subj: str, force: bool = False) -> tuple[str, int, float]:
     return subj, len(y), time.time() - t0
 
 
+def cache_subject_bins(subj: str, force: bool = False) -> tuple[str, int, float]:
+    out = F.BINS_ROOT / f"{subj}.npz"
+    if out.is_file() and not force:
+        return subj, -1, 0.0
+    t0 = time.time()
+    cache = F.MinuteCache(capacity=1)
+    n_res = sum(len(F.BAND_RESONATORS[b]) for b in F.BANDS) * len(F.CHANNELS)
+    X, y, g, start = [], [], [], []
+    for win in F.enumerate_windows([subj], F.WINDOW_SECONDS, F.WINDOW_OVERLAP):
+        try:
+            bw = F.window_bins(win, cache)
+        except FileNotFoundError:
+            continue
+        x = np.zeros((F.N_BINS, n_res), np.int16)
+        col = 0
+        for ch in F.CHANNELS:
+            for b in F.BANDS:
+                v = bw.get((ch, b), [])
+                for i in range(len(F.BAND_RESONATORS[b])):
+                    if i < len(v):
+                        x[:len(v[i]), col] = v[i][:F.N_BINS]
+                    col += 1
+        X.append(x)
+        y.append(1 if win["window_label"] == "seizure" else 0)
+        g.append(win["trial"]); start.append(win["abs_start_s"])
+    if not y:
+        return subj, 0, time.time() - t0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out, X_bins=np.stack(X), y=np.asarray(y, np.int8),
+                        groups=np.asarray(g), start_s=np.asarray(start, np.float32))
+    return subj, len(y), time.time() - t0
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     force = "--force" in sys.argv
     subjects = args or sorted(p.name for p in Path(F.SPIKES_ROOT).iterdir() if p.is_dir())
-    print(f"Caching {len(subjects)} patients -> {F.CACHE_ROOT}", flush=True)
+    bins = "--bins" in sys.argv
+    fn = cache_subject_bins if bins else cache_subject
+    print(f"Caching {len(subjects)} patients -> {F.BINS_ROOT if bins else F.CACHE_ROOT}", flush=True)
     workers = min(int(os.environ.get("WORKERS", 3)), len(subjects))
     failed = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(cache_subject, s, force): s for s in subjects}
+        futs = {ex.submit(fn, s, force): s for s in subjects}
         for f in as_completed(futs):
             try:
                 subj, n, dt = f.result()
