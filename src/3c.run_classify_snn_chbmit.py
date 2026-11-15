@@ -12,7 +12,8 @@ Usage:
     python -u src/3c.run_classify_snn_chbmit.py chb01 chb03
 Env:
     FEATURE_LEVEL = band (default) | resonator
-    HIDDEN=64  T=50  EPOCHS=30  LR=0.01  BETA=0.9  WORKERS=8
+    HIDDEN=64  T=50  EPOCHS=30  LR=0.01  BETA=0.9  SEED=0  WORKERS=8
+    TAG = suffix for the report file (sweeps)
 """
 from __future__ import annotations
 
@@ -41,7 +42,8 @@ EPOCHS = int(os.environ.get("EPOCHS", 30))
 LR = float(os.environ.get("LR", 0.01))
 BETA = float(os.environ.get("BETA", 0.9))
 BATCH = 128
-SEED = 0
+SEED = int(os.environ.get("SEED", 0))
+TAG = os.environ.get("TAG", "")
 THRESH = 1.0
 SLOPE = 10.0
 torch.set_num_threads(int(os.environ.get("TORCH_THREADS", 1)))
@@ -165,9 +167,10 @@ def run_patient(subj: str):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    patients = args or sorted(p.stem for p in F.CACHE_ROOT.glob("chb*.npz"))
+    patients = args or [p.stem for p in sorted(F.CACHE_ROOT.glob("chb*.npz"),
+                                               key=lambda p: -p.stat().st_size)]
     workers = min(int(os.environ.get("WORKERS", 8)), len(patients))
-    print(f"SNN {FEATURE_LEVEL}: hidden={HIDDEN} T={T} epochs={EPOCHS} lr={LR} beta={BETA}"
+    print(f"SNN {FEATURE_LEVEL}: hidden={HIDDEN} T={T} epochs={EPOCHS} lr={LR} beta={BETA} seed={SEED}"
           f" | patients: {len(patients)} | workers: {workers}", flush=True)
 
     svm_csv = OUT_DIR / "svm_classifier_report.csv"
@@ -188,7 +191,7 @@ def main():
     if not rows:
         print("No patients classified."); return
     df = pd.DataFrame(rows).sort_values("patient")
-    out = OUT_DIR / "snn_classifier_report.csv"
+    out = OUT_DIR / ("snn_classifier_report" + (f"_{TAG}" if TAG else "") + ".csv")
     df.to_csv(out, index=False)
     print(f"\nSNN  LORO AUC: mean {df['loro_auc'].mean():.3f}  median {df['loro_auc'].median():.3f}")
     if df["svm_loro_auc"].notna().any():
