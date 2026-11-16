@@ -73,7 +73,9 @@ BAND_RESONATORS = {
 GAMMA_RESONATORS = [34.7, 37.2, 40.2, 43.2, 47.7, 52.6, 57.2]
 
 
-CACHE_ROOT = Path(SPIKES_ROOT).parent / "features_cache"
+# Caches follow the spike folder: spikes_raw -> features_cache, spikes_raw_x -> features_cache_x.
+_SFX = Path(SPIKES_ROOT).name.removeprefix("spikes_raw")
+CACHE_ROOT = Path(SPIKES_ROOT).parent / f"features_cache{_SFX}"
 
 
 def cache_path(subject: str) -> Path:
@@ -90,7 +92,7 @@ def load_cached(subject: str, feature_level: str = "band"):
     return X.astype(np.float64), d["y"].astype(int), d["groups"]
 
 
-BINS_ROOT = Path(SPIKES_ROOT).parent / "bins_cache"
+BINS_ROOT = Path(SPIKES_ROOT).parent / f"bins_cache{_SFX}"
 
 
 def load_bins(subject: str):

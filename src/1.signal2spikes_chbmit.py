@@ -52,7 +52,11 @@ _project_root = _script_dir.parent
 _data_root = _Path(_os.environ.get("PIPELINE_DATA_ROOT", str(_project_root)))
 
 CHBMIT_ROOT = str(_data_root / "dataset" / "chbmit")
-SPIKES_ROOT = str(_data_root / "dataset" / "spikes_raw")
+# SPIKES_ROOT env: alternate spike folder (e.g. a re-encoding with another input scaling).
+SPIKES_ROOT = _os.environ.get("SPIKES_ROOT") or str(_data_root / "dataset" / "spikes_raw")
+# Input scaling before the resonators. 0 = per-minute peak (original behaviour);
+# >0 = fixed full-scale in microvolts with clipping, like an ADC input range.
+INPUT_FULL_SCALE_UV = float(_os.environ.get("INPUT_FULL_SCALE_UV", 0))
 OUTPUT_PATH = str(_data_root / "dataset" / "spikes_windowed")
 
 fs = 256  # Hz
@@ -222,7 +226,8 @@ def _run_one_resonator(args):
 def _resample_channel(ch_data, minute_labels, n_samples):
     """{clk_freq: {(label, minute): resampled_signal}} for one channel.
 
-    Per-minute peak-normalised then resampled to each clock rate.
+    Scaled to [-1, 1] (per-minute peak, or fixed full-scale if INPUT_FULL_SCALE_UV)
+    then resampled to each clock rate.
     """
     resampled_by_clk = {}
     for clk_freq in clk_resonators.keys():
@@ -234,9 +239,12 @@ def _resample_channel(ch_data, minute_labels, n_samples):
                 if stop_sample <= start_sample:
                     continue
                 seg = ch_data[start_sample:stop_sample]
-                seg_peak = np.max(np.abs(seg))
-                if seg_peak > 0:
-                    seg = seg / seg_peak
+                if INPUT_FULL_SCALE_UV > 0:
+                    seg = np.clip(seg / (INPUT_FULL_SCALE_UV * 1e-6), -1.0, 1.0)
+                else:
+                    seg_peak = np.max(np.abs(seg))
+                    if seg_peak > 0:
+                        seg = seg / seg_peak
                 rs = resample_signal(clk_freq, fs, seg)
                 if rs.size > 0:
                     resampled_by_minute[(label, minute)] = rs

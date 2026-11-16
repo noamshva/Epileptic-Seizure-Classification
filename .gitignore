@@ -24,6 +24,9 @@ dataset/spikes_raw/*
 dataset/spikes_windowed/*
 dataset/features_cache/
 dataset/bins_cache/
+dataset/spikes_raw_*/
+dataset/features_cache_*/
+dataset/bins_cache_*/
 
 !dataset/chbmit/
 !dataset/spikes_raw/
