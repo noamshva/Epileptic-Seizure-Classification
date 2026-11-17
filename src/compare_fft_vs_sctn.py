@@ -14,6 +14,9 @@ Outputs (under PIPELINE_DATA_ROOT or the repo, in analysis/stats/):
 Usage:
     python -u src/compare_fft_vs_sctn.py               # all 24 patients
     python -u src/compare_fft_vs_sctn.py chb01 chb03   # a subset
+Env:
+    SPIKES_ROOT = spike folder to compare (e.g. dataset/spikes_raw_fs100)
+    TAG = suffix for the output files, so encodings do not overwrite each other
 """
 from __future__ import annotations
 
@@ -40,6 +43,8 @@ import features as F                                                    # noqa: 
 
 SEED = 0
 PCA_DIM = 40
+TAG = os.environ.get("TAG", "")
+_SFX = f"_{TAG}" if TAG else ""
 _OUT = Path(os.environ.get("PIPELINE_DATA_ROOT", str(_SRC.parent))) / "analysis" / "stats"
 _OUT.mkdir(parents=True, exist_ok=True)
 
@@ -72,6 +77,13 @@ def _loro_auc(name: str, X, y, g, pca: bool = False) -> float:
     if ok.sum() == 0 or len(set(y[ok].tolist())) < 2:
         return float("nan")
     return float(roc_auc_score(y[ok], ps[ok]))
+
+
+def _sctn(subjects):
+    """SCTN band features, from the feature cache when it exists."""
+    if F.cache_path(subjects[0]).is_file():
+        return (*F.load_cached(subjects[0], "band"), None)
+    return F.build_dataset_groups(subjects)
 
 
 def _cell(rec, prefix, loader, subj, pca=False):
@@ -115,7 +127,7 @@ def main():
     rows = []
     for subj in patients:
         rec = {"patient": subj}
-        _cell(rec, "sctn", F.build_dataset_groups, subj)
+        _cell(rec, "sctn", _sctn, subj)
         _cell(rec, "fftband", F.build_fft_bandpower, subj)
         _cell(rec, "fftfine", F.build_fft_fine, subj, pca=True)
         rows.append(rec)
@@ -125,7 +137,7 @@ def main():
         print(f"{subj} (rec={rec.get('n_rec','?')}): {got}", flush=True)
 
     df = pd.DataFrame(rows)
-    csv = _OUT / "fft_vs_sctn_per_patient.csv"
+    csv = _OUT / f"fft_vs_sctn_per_patient{_SFX}.csv"
     df.to_csv(csv, index=False)
 
     summary = {}
@@ -136,7 +148,7 @@ def main():
             "sctn_vs_fftfine_all": _summ(df, f"sctn_{clf}", f"fftfine_{clf}"),
             "sctn_vs_fftfine_ge5rec": _summ(df, f"sctn_{clf}", f"fftfine_{clf}", 5),
         }
-    js = _OUT / "fft_vs_sctn_summary.json"
+    js = _OUT / f"fft_vs_sctn_summary{_SFX}.json"
     js.write_text(json.dumps(summary, indent=2))
 
     print("\n=== SUMMARY ===", flush=True)
