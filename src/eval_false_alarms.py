@@ -11,8 +11,13 @@ Per-window scores go to analysis/stats/fa_scores_<model>/ for threshold curves.
 tune_mask() fixes which seizure-free recordings may be used for tuning; the
 rest are held out.
 
+AUGMENT=1 adds the tuning half as non-seizure training data (also inside each
+LORO fold) and counts false alarms on the held-out half only.
+ALARM_RUN sets the alarm length (default 3).
+
 Usage:
     python -u src/eval_false_alarms.py svm
+    AUGMENT=1 ALARM_RUN=5 python -u src/eval_false_alarms.py svm
     python -u src/eval_false_alarms.py fft      # FFT band power + SVM (cache_features.py --fft)
     python -u src/eval_false_alarms.py snn
     INPUT=bins READOUT=membrane LR=0.002 CLIP=1 EPOCHS=60 python -u src/eval_false_alarms.py snn
@@ -37,10 +42,11 @@ _SRC = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SRC))
 import features as F                                                    # noqa: E402
 
-ALARM_RUN = 3
+ALARM_RUN = int(os.environ.get("ALARM_RUN", 3))
+AUGMENT = os.environ.get("AUGMENT", "0") == "1"
 MODEL = next((a for a in sys.argv[1:] if a in ("svm", "snn", "fft")), "svm")
 BINS = MODEL == "snn" and os.environ.get("INPUT", "features") == "bins"
-NAME = "snn_bins" if BINS else MODEL
+NAME = ("snn_bins" if BINS else MODEL) + ("_aug" if AUGMENT else "")
 _OUT = Path(os.environ.get("PIPELINE_DATA_ROOT", str(_SRC.parent))) / "analysis" / "stats"
 
 
@@ -102,21 +108,27 @@ def run_patient(subj):
     X, y, g, st = _load(subj, False)
     Xf, yf, gf, sf = _load(subj, True)
 
+    tune = tune_mask(subj, gf)
+    Xa = np.concatenate([X, Xf]); ya = np.concatenate([y, yf])
+    extra = len(y) + np.flatnonzero(tune) if AUGMENT else np.array([], int)
+
     pred = np.zeros(len(y), int); score = np.full(len(y), np.nan)
     for tr, te in LeaveOneGroupOut().split(X, y, groups=g):
         if len(set(y[tr].tolist())) == 2:
-            pred[te], score[te] = _predict(X, y, tr, te)
+            pred[te], score[te] = _predict(Xa, ya, np.concatenate([tr, extra]), te)
 
     # seizure events = segments of seizure-labelled windows
     sz = np.flatnonzero(y == 1)
     seg, order = _segments(g[sz], st[sz])
     hit = {s for s, n in _runs(pred[sz] == 1, seg, order) if n >= ALARM_RUN}
 
-    Xa = np.concatenate([X, Xf])
-    predf, scoref = _predict(Xa, np.concatenate([y, yf]), np.arange(len(y)), np.arange(len(y), len(Xa)))
+    predf, scoref = _predict(Xa, ya, np.concatenate([np.arange(len(y)), extra]),
+                             np.arange(len(y), len(Xa)))
     sdir = _OUT / f"fa_scores_{NAME}"; sdir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(sdir / f"{subj}.npz", y=y, g=g, st=st, score=score,
-                        gf=gf, sf=sf, scoref=scoref, tune=tune_mask(subj, gf))
+                        gf=gf, sf=sf, scoref=scoref, tune=tune)
+    if AUGMENT:                                        # score the held-out half only
+        gf, sf, yf, predf = gf[~tune], sf[~tune], yf[~tune], predf[~tune]
     segf, orderf = _segments(gf, sf)
     alarms = sum(n >= ALARM_RUN for _, n in _runs(predf == 1, segf, orderf))
     hours = len(yf) / 59 / 60
@@ -132,7 +144,8 @@ def run_patient(subj):
 def main():
     patients = [a for a in sys.argv[1:] if a.startswith("chb")] or [f"chb{n:02d}" for n in range(1, 25)]
     workers = min(int(os.environ.get("WORKERS", 8)), len(patients))
-    print(f"{NAME}: {len(patients)} patients, alarm = {ALARM_RUN} consecutive windows", flush=True)
+    print(f"{NAME}: {len(patients)} patients, alarm = {ALARM_RUN} consecutive windows"
+          f"{', held-out half' if AUGMENT else ''}", flush=True)
     rows = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
         for fut in as_completed([ex.submit(run_patient, s) for s in patients]):
@@ -142,7 +155,7 @@ def main():
                   f" | FA/h {r['fa_per_hour']:.1f} ({r['free_hours']:.2f} h)", flush=True)
     df = pd.DataFrame(rows).sort_values("patient")
     _OUT.mkdir(parents=True, exist_ok=True)
-    out = _OUT / f"false_alarms_{NAME}.csv"
+    out = _OUT / f"false_alarms_{NAME}{'' if ALARM_RUN == 3 else f'_k{ALARM_RUN}'}.csv"
     df.to_csv(out, index=False)
     h = df.free_hours.sum()
     print(f"\nSeizures detected: {df.seizures_detected.sum()}/{df.seizures.sum()}"
