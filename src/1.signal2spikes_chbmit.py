@@ -54,9 +54,10 @@ _data_root = _Path(_os.environ.get("PIPELINE_DATA_ROOT", str(_project_root)))
 CHBMIT_ROOT = str(_data_root / "dataset" / "chbmit")
 # SPIKES_ROOT env: alternate spike folder (e.g. a re-encoding with another input scaling).
 SPIKES_ROOT = _os.environ.get("SPIKES_ROOT") or str(_data_root / "dataset" / "spikes_raw")
-# Input scaling before the resonators. 0 = per-minute peak (original behaviour);
-# >0 = fixed full-scale in microvolts with clipping, like an ADC input range.
-INPUT_FULL_SCALE_UV = float(_os.environ.get("INPUT_FULL_SCALE_UV", 0))
+# Input scaling before the resonators: fixed full-scale in microvolts with
+# clipping, like an ADC input range. 0 = per-minute peak (the original behaviour,
+# which removes the amplitude difference between seizure and non-seizure minutes).
+INPUT_FULL_SCALE_UV = float(_os.environ.get("INPUT_FULL_SCALE_UV", 100))
 OUTPUT_PATH = str(_data_root / "dataset" / "spikes_windowed")
 
 fs = 256  # Hz
@@ -97,6 +98,9 @@ SUBJECTS = [f"chb{n:02d}" for n in range(1, 25)]   # all CHB-MIT patients
 EDF_WHITELIST = []                # [] → all EDFs (further filtered by SEIZURE_ONLY)
 SEIZURE_ONLY = True               # when EDF_WHITELIST empty, keep only seizure recordings
 SEIZURE_FREE = os.environ.get("SEIZURE_FREE", "0") == "1"   # instead: only seizure-free recordings
+FREE_MINUTES = int(os.environ.get("FREE_MINUTES", 2))       # minutes taken from a seizure-free recording
+# FREE_SEED set: per-recording random minutes, never the ones the default draw takes.
+FREE_SEED = os.environ.get("FREE_SEED")
 
 # Notebook/CLI override: PIPELINE_SUBJECTS="chb01,chb02" scopes the run.
 if os.environ.get("PIPELINE_SUBJECTS"):
@@ -410,7 +414,7 @@ def read_edf_channels_bipolar(edf_path: str, desired_bipolar_channels: list[str]
     return df
 
 
-def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, rng=None):
+def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, rng=None, name=""):
     """
     Select which minutes to encode and label each as seizure / non_seizure.
 
@@ -460,6 +464,17 @@ def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, 
         # No seizure in this EDF: keep a small interictal sample for negative-only training
         k = min(2, len(interictal_minutes))
         chosen = rng.choice(interictal_minutes, size=k, replace=False).tolist() if k else []
+        if FREE_SEED is None:
+            k = min(FREE_MINUTES, len(interictal_minutes))
+            if k != len(chosen):
+                chosen = np.random.default_rng(SAMPLING_SEED).choice(
+                    interictal_minutes, size=k, replace=False).tolist() if k else []
+        else:
+            import zlib
+            pool = [m for m in interictal_minutes if m not in set(chosen)]
+            k = min(FREE_MINUTES, len(pool))
+            r2 = np.random.default_rng([int(FREE_SEED), zlib.crc32(name.encode())])
+            chosen = r2.choice(pool, size=k, replace=False).tolist() if k else []
         chosen_non_seizure = sorted(int(m) for m in chosen)
     else:
         chosen_non_seizure = []
@@ -552,7 +567,7 @@ def process_file(subject: str,
     n_samples = df.shape[0]
 
     seizure_intervals = seizures_by_file.get(edf_file, [])
-    minute_labels = get_minutes_with_labels(n_samples, fs, seizure_intervals)
+    minute_labels = get_minutes_with_labels(n_samples, fs, seizure_intervals, name=edf_file)
 
     n_seiz = len(minute_labels.get("seizure", []))
     n_non = len(minute_labels.get("non_seizure", []))

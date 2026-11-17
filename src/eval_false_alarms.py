@@ -14,10 +14,14 @@ rest are held out.
 AUGMENT=1 adds the tuning half as non-seizure training data (also inside each
 LORO fold) and counts false alarms on the held-out half only.
 ALARM_RUN sets the alarm length (default 3).
+FINAL=1 is the frozen test: train on the seizure recordings plus all of
+<SPIKES_ROOT>_free, count false alarms on <SPIKES_ROOT>_free2 (new minutes,
+encoder FREE_SEED=1 FREE_MINUTES=4). SEED picks the SNN seed.
 
 Usage:
     python -u src/eval_false_alarms.py svm
     AUGMENT=1 ALARM_RUN=5 python -u src/eval_false_alarms.py svm
+    FINAL=1 ALARM_RUN=5 SEED=0 python -u src/eval_false_alarms.py snn
     python -u src/eval_false_alarms.py fft      # FFT band power + SVM (cache_features.py --fft)
     python -u src/eval_false_alarms.py snn
     INPUT=bins READOUT=membrane LR=0.002 CLIP=1 EPOCHS=60 python -u src/eval_false_alarms.py snn
@@ -44,9 +48,11 @@ import features as F                                                    # noqa: 
 
 ALARM_RUN = int(os.environ.get("ALARM_RUN", 3))
 AUGMENT = os.environ.get("AUGMENT", "0") == "1"
+FINAL = os.environ.get("FINAL", "0") == "1"
 MODEL = next((a for a in sys.argv[1:] if a in ("svm", "snn", "fft")), "svm")
 BINS = MODEL == "snn" and os.environ.get("INPUT", "features") == "bins"
-NAME = ("snn_bins" if BINS else MODEL) + ("_aug" if AUGMENT else "")
+NAME = (("snn_bins" if BINS else MODEL) + ("_aug" if AUGMENT else "") + ("_final" if FINAL else "")
+        + (f"_s{os.environ['SEED']}" if MODEL == "snn" and "SEED" in os.environ else ""))
 _OUT = Path(os.environ.get("PIPELINE_DATA_ROOT", str(_SRC.parent))) / "analysis" / "stats"
 
 
@@ -58,10 +64,9 @@ def tune_mask(subj, groups):
     return np.array([r in tune for r in groups.tolist()])
 
 
-def _load(subj, free):
+def _load(subj, sfx=""):
     root = F.BINS_ROOT if BINS else F.FFT_ROOT if MODEL == "fft" else F.CACHE_ROOT
-    if free:
-        root = root.parent / (root.name + "_free")
+    root = root.parent / (root.name + sfx)
     d = np.load(root / f"{subj}.npz")
     X = d["X_bins"] if BINS else d["X_band"].astype(np.float64)
     return X, d["y"].astype(int), d["groups"], d["start_s"].astype(float)
@@ -105,12 +110,17 @@ def _runs(flag, seg, order):
 
 
 def run_patient(subj):
-    X, y, g, st = _load(subj, False)
-    Xf, yf, gf, sf = _load(subj, True)
+    X, y, g, st = _load(subj)
+    Xf, yf, gf, sf = _load(subj, "_free")
 
     tune = tune_mask(subj, gf)
     Xa = np.concatenate([X, Xf]); ya = np.concatenate([y, yf])
     extra = len(y) + np.flatnonzero(tune) if AUGMENT else np.array([], int)
+    if FINAL:                                          # all of _free trains, _free2 tests
+        extra = len(y) + np.arange(len(yf))
+        Xf, yf, gf, sf = _load(subj, "_free2")
+        tune = np.zeros(len(yf), bool)
+        Xa = np.concatenate([Xa, Xf]); ya = np.concatenate([ya, yf])
 
     pred = np.zeros(len(y), int); score = np.full(len(y), np.nan)
     for tr, te in LeaveOneGroupOut().split(X, y, groups=g):
@@ -123,7 +133,7 @@ def run_patient(subj):
     hit = {s for s, n in _runs(pred[sz] == 1, seg, order) if n >= ALARM_RUN}
 
     predf, scoref = _predict(Xa, ya, np.concatenate([np.arange(len(y)), extra]),
-                             np.arange(len(y), len(Xa)))
+                             np.arange(len(Xa) - len(yf), len(Xa)))
     sdir = _OUT / f"fa_scores_{NAME}"; sdir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(sdir / f"{subj}.npz", y=y, g=g, st=st, score=score,
                         gf=gf, sf=sf, scoref=scoref, tune=tune)
@@ -145,7 +155,7 @@ def main():
     patients = [a for a in sys.argv[1:] if a.startswith("chb")] or [f"chb{n:02d}" for n in range(1, 25)]
     workers = min(int(os.environ.get("WORKERS", 8)), len(patients))
     print(f"{NAME}: {len(patients)} patients, alarm = {ALARM_RUN} consecutive windows"
-          f"{', held-out half' if AUGMENT else ''}", flush=True)
+          f"{', held-out half' if AUGMENT else ''}{', final test' if FINAL else ''}", flush=True)
     rows = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
         for fut in as_completed([ex.submit(run_patient, s) for s in patients]):

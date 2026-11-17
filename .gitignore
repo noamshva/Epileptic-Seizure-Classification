@@ -71,3 +71,4 @@ encoding_*.log
 .claude/
 
 dataset/fft_cache*/
+backups/
