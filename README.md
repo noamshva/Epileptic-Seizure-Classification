@@ -90,6 +90,7 @@ cross-file imports use `importlib`, so nothing needs to be importable as a modul
 | EEG sampling rate | 256 Hz (CHB-MIT) |
 | Band-pass | 0.5–62 Hz, Butterworth order 6 |
 | Channels | 10 CHB-MIT bipolar pairs |
+| Input scaling | fixed full scale of 100 µV with clipping (`INPUT_FULL_SCALE_UV`); `0` restores the old per-minute peak scaling |
 | Bands | Delta, Theta, Alpha, Beta (Gamma encoded on disk; excluded from the active feature set) |
 | Resonator clocks | < 10 Hz @ 15.36 kHz, ≥ 10 Hz @ 153.6 kHz (matches SCTN pre-trained params) |
 | Window | 2 s, 50 % overlap (Shoeb 2010) |
@@ -97,6 +98,21 @@ cross-file imports use `importlib`, so nothing needs to be importable as a modul
 | Guard band | 5 min around each seizure; interictal pool subsampled to match seizure-minute count per EDF |
 | Classifiers | SVM-RBF (C=1, γ=scale, class-balanced) · Random Forest (300 trees) |
 | Evaluation | leave-one-recording-out (honest) + stratified 5-fold (leaky, for reference) |
+
+## Frozen detector protocol (fixed 2026-11-17, before the final test data was scored)
+
+- Per-patient models. Training data: the patient's seizure recordings plus the
+  two minutes already encoded from each of that patient's seizure-free
+  recordings (`dataset/spikes_raw_free`), as extra non-seizure examples.
+- Models as reported: SVM on 40 SCTN features, SVM on 40 FFT band powers, SNN on
+  40 SCTN features (seeds 0, 1, 2), SNN on binned spikes (`INPUT=bins
+  READOUT=membrane LR=0.002 CLIP=1 EPOCHS=60`, seed 0).
+- Decision: each model's default threshold. Alarm: 5 consecutive flagged windows.
+- Sensitivity and detection delay: leave-one-recording-out over the seizure
+  recordings, with the same seizure-free training data in every fold.
+- False alarms: four new random minutes from every seizure-free recording
+  (`dataset/spikes_raw_free2`, encoder `SEIZURE_FREE=1 FREE_SEED=1
+  FREE_MINUTES=4`), scored once: `FINAL=1 ALARM_RUN=5 python src/eval_false_alarms.py <model>`.
 
 ## Performance note
 
