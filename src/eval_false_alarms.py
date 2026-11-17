@@ -7,9 +7,13 @@ Per patient:
 Default decision threshold. Alarm = ALARM_RUN consecutive flagged windows.
 
 Needs caches for SPIKES_ROOT and for <SPIKES_ROOT>_free (encoder SEIZURE_FREE=1).
+Per-window scores go to analysis/stats/fa_scores_<model>/ for threshold curves.
+tune_mask() fixes which seizure-free recordings may be used for tuning; the
+rest are held out.
 
 Usage:
     python -u src/eval_false_alarms.py svm
+    python -u src/eval_false_alarms.py fft      # FFT band power + SVM (cache_features.py --fft)
     python -u src/eval_false_alarms.py snn
     INPUT=bins READOUT=membrane LR=0.002 CLIP=1 EPOCHS=60 python -u src/eval_false_alarms.py snn
 """
@@ -18,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -33,14 +38,22 @@ sys.path.insert(0, str(_SRC))
 import features as F                                                    # noqa: E402
 
 ALARM_RUN = 3
-MODEL = next((a for a in sys.argv[1:] if a in ("svm", "snn")), "svm")
+MODEL = next((a for a in sys.argv[1:] if a in ("svm", "snn", "fft")), "svm")
 BINS = MODEL == "snn" and os.environ.get("INPUT", "features") == "bins"
 NAME = "snn_bins" if BINS else MODEL
 _OUT = Path(os.environ.get("PIPELINE_DATA_ROOT", str(_SRC.parent))) / "analysis" / "stats"
 
 
+def tune_mask(subj, groups):
+    """True for windows of the tuning half of a patient's seizure-free recordings."""
+    recs = sorted(set(groups.tolist()))
+    perm = np.random.default_rng(zlib.crc32(subj.encode())).permutation(len(recs))
+    tune = {recs[i] for i in perm[: (len(recs) + 1) // 2]}
+    return np.array([r in tune for r in groups.tolist()])
+
+
 def _load(subj, free):
-    root = F.BINS_ROOT if BINS else F.CACHE_ROOT
+    root = F.BINS_ROOT if BINS else F.FFT_ROOT if MODEL == "fft" else F.CACHE_ROOT
     if free:
         root = root.parent / (root.name + "_free")
     d = np.load(root / f"{subj}.npz")
@@ -49,14 +62,16 @@ def _load(subj, free):
 
 
 def _predict(X, y, tr, te):
-    """Hard labels for te from a model trained on tr."""
-    if MODEL == "svm":
+    """(label, score) for te from a model trained on tr."""
+    if MODEL in ("svm", "fft"):
         m = make_pipeline(StandardScaler(), SVC(kernel="rbf", C=1.0, gamma="scale",
                                                 class_weight="balanced", random_state=0))
-        return m.fit(X[tr], y[tr]).predict(X[te])
+        sc = m.fit(X[tr], y[tr]).decision_function(X[te])
+        return (sc > 0).astype(int), sc
     spec = importlib.util.spec_from_file_location("snn3c", _SRC / "3c.run_classify_snn_chbmit.py")
     snn = importlib.util.module_from_spec(spec); spec.loader.exec_module(snn)
-    return snn.fit_predict(X, y, tr, te)[1]
+    prob, pred = snn.fit_predict(X, y, tr, te)[:2]
+    return pred, prob
 
 
 def _segments(g, start):
@@ -87,10 +102,10 @@ def run_patient(subj):
     X, y, g, st = _load(subj, False)
     Xf, yf, gf, sf = _load(subj, True)
 
-    pred = np.zeros(len(y), int)
+    pred = np.zeros(len(y), int); score = np.full(len(y), np.nan)
     for tr, te in LeaveOneGroupOut().split(X, y, groups=g):
         if len(set(y[tr].tolist())) == 2:
-            pred[te] = _predict(X, y, tr, te)
+            pred[te], score[te] = _predict(X, y, tr, te)
 
     # seizure events = segments of seizure-labelled windows
     sz = np.flatnonzero(y == 1)
@@ -98,7 +113,10 @@ def run_patient(subj):
     hit = {s for s, n in _runs(pred[sz] == 1, seg, order) if n >= ALARM_RUN}
 
     Xa = np.concatenate([X, Xf])
-    predf = _predict(Xa, np.concatenate([y, yf]), np.arange(len(y)), np.arange(len(y), len(Xa)))
+    predf, scoref = _predict(Xa, np.concatenate([y, yf]), np.arange(len(y)), np.arange(len(y), len(Xa)))
+    sdir = _OUT / f"fa_scores_{NAME}"; sdir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(sdir / f"{subj}.npz", y=y, g=g, st=st, score=score,
+                        gf=gf, sf=sf, scoref=scoref, tune=tune_mask(subj, gf))
     segf, orderf = _segments(gf, sf)
     alarms = sum(n >= ALARM_RUN for _, n in _runs(predf == 1, segf, orderf))
     hours = len(yf) / 59 / 60

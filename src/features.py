@@ -93,6 +93,7 @@ def load_cached(subject: str, feature_level: str = "band"):
 
 
 BINS_ROOT = Path(SPIKES_ROOT).parent / f"bins_cache{_SFX}"
+FFT_ROOT = Path(SPIKES_ROOT).parent / f"fft_cache{_SFX}"
 
 
 def load_bins(subject: str):
@@ -337,7 +338,7 @@ def _fft_bandpass(data, f_lo, f_hi, fs):
     return filtfilt(b2, a2, filtfilt(b1, a1, data, axis=0), axis=0)
 
 
-def _load_eeg_per_trial(subjects):
+def _load_eeg_per_trial(subjects, only=None):
     """{trial_stem: {channel: bandpassed 1-D signal}} for encoded trials only."""
     import mne
     from pathlib import Path as _P
@@ -349,7 +350,7 @@ def _load_eeg_per_trial(subjects):
             continue
         encoded = {p.name for p in (Path(SPIKES_ROOT) / subj).glob("*")}
         for edf in sorted(subj_dir.glob("*.edf")):
-            if edf.stem not in encoded:
+            if edf.stem not in encoded or (only is not None and edf.stem not in only):
                 continue
             raw = mne.io.read_raw_edf(str(edf), preload=True, verbose="ERROR")
             avail = [c.strip() for c in raw.ch_names]

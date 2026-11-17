@@ -14,10 +14,14 @@ With --bins it instead writes <data root>/dataset/bins_cache/<subject>.npz with:
     X_bins  [n, 200, 280] int16  10-ms spike counts per resonator
     y, groups, start_s           as above
 
+With --fft it writes <data root>/dataset/fft_cache/<subject>.npz with the FFT
+band-power baseline (X_band [n, 40]) on the same windows.
+
 Usage:
     python -u src/cache_features.py                # all encoded patients
     python -u src/cache_features.py chb01 chb03
     python -u src/cache_features.py --bins
+    python -u src/cache_features.py --fft
 """
 from __future__ import annotations
 
@@ -100,13 +104,49 @@ def cache_subject_bins(subj: str, force: bool = False) -> tuple[str, int, float]
     return subj, len(y), time.time() - t0
 
 
+def cache_subject_fft(subj: str, force: bool = False) -> tuple[str, int, float]:
+    out = F.FFT_ROOT / f"{subj}.npz"
+    if out.is_file() and not force:
+        return subj, -1, 0.0
+    t0 = time.time()
+    bands = list(F._FFT_BANDS)[:4]
+    n_win = int(round(F.WINDOW_SECONDS * F._FFT_FS))
+    X, y, g, start = [], [], [], []
+    trial, eeg = None, None
+    for win in F.enumerate_windows([subj], F.WINDOW_SECONDS, F.WINDOW_OVERLAP):
+        if win["trial"] != trial:                      # one recording in memory at a time
+            trial = win["trial"]
+            eeg = F._load_eeg_per_trial([subj], only={trial}).get(trial)
+        if eeg is None:
+            continue
+        a = int(round(win["abs_start_s"] * F._FFT_FS)); b = a + n_win
+        feats = []
+        for ch in F.CHANNELS:
+            sig = eeg.get(ch)
+            for band in bands:
+                lo, hi = F._FFT_BANDS[band]
+                feats.append(0.0 if sig is None or b > len(sig)
+                             else float(F._fft_window(sig[a:b], lo, hi, "band")[0]))
+        X.append(feats)
+        y.append(1 if win["window_label"] == "seizure" else 0)
+        g.append(win["trial"]); start.append(win["abs_start_s"])
+    if not y:
+        return subj, 0, time.time() - t0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out, X_band=np.asarray(X, np.float64), y=np.asarray(y, np.int8),
+                        groups=np.asarray(g), start_s=np.asarray(start, np.float32))
+    return subj, len(y), time.time() - t0
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     force = "--force" in sys.argv
     subjects = args or sorted(p.name for p in Path(F.SPIKES_ROOT).iterdir() if p.is_dir())
     bins = "--bins" in sys.argv
-    fn = cache_subject_bins if bins else cache_subject
-    print(f"Caching {len(subjects)} patients -> {F.BINS_ROOT if bins else F.CACHE_ROOT}", flush=True)
+    fft = "--fft" in sys.argv
+    fn = cache_subject_fft if fft else cache_subject_bins if bins else cache_subject
+    print(f"Caching {len(subjects)} patients -> "
+          f"{F.FFT_ROOT if fft else F.BINS_ROOT if bins else F.CACHE_ROOT}", flush=True)
     workers = min(int(os.environ.get("WORKERS", 3)), len(subjects))
     failed = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
