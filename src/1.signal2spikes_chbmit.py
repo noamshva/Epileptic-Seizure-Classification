@@ -96,6 +96,7 @@ clk_resonators = {
 SUBJECTS = [f"chb{n:02d}" for n in range(1, 25)]   # all CHB-MIT patients
 EDF_WHITELIST = []                # [] → all EDFs (further filtered by SEIZURE_ONLY)
 SEIZURE_ONLY = True               # when EDF_WHITELIST empty, keep only seizure recordings
+SEIZURE_FREE = os.environ.get("SEIZURE_FREE", "0") == "1"   # instead: only seizure-free recordings
 
 # Notebook/CLI override: PIPELINE_SUBJECTS="chb01,chb02" scopes the run.
 if os.environ.get("PIPELINE_SUBJECTS"):
@@ -966,6 +967,8 @@ def main():
         edf_files = sorted(f for f in os.listdir(subj_dir) if f.lower().endswith(".edf"))
         if EDF_WHITELIST:
             edf_files = [f for f in edf_files if f in EDF_WHITELIST]
+        elif SEIZURE_FREE:
+            edf_files = [f for f in edf_files if not seizures_by_file.get(f)]
         elif SEIZURE_ONLY:
             edf_files = [f for f in edf_files if seizures_by_file.get(f)]
         for edf_file in edf_files:
