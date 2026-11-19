@@ -124,17 +124,44 @@ faster and bit-identical** to the on-disk spikes — which makes encoding the fu
 
 ## Results (summary)
 
-On 24 CHB-MIT patients (138 seizure recordings encoded), leave-one-recording-out:
+24 CHB-MIT patients, 138 seizure recordings (185 seizures), fixed 100 µV input scaling.
 
-- **Within a recording**, SCTN burstiness matches classical FFT band-power.
-- **Across unseen recordings**, a band-matched fine-FFT holds a *small* edge
-  (median ΔAUC ≈ 0.01–0.03) that is **not robustly significant** — it is driven
-  by a few low-recording patients and vanishes on well-powered ones; SCTN wins on
-  a subset of patients.
-- The **Gamma band is neutral** (adding it does not change performance).
+**Window classification** (per patient, leave-one-recording-out, pooled AUC):
 
-Net: a multiplier-free neuromorphic front-end lands within ~1–3 AUC points of the
-best classical FFT features. (See `analysis/stats/` for per-patient tables.)
+| Features + classifier | Mean AUC |
+|---|---|
+| SCTN 40-D + SVM | 0.962 |
+| SCTN 280-D + SVM | 0.967 |
+| SCTN 40-D + SNN (3 seeds) | 0.957 |
+| SCTN binned spikes + SNN | 0.943 |
+| FFT band power + SVM | 0.932 |
+| FFT band power, clipped at 100 µV, + SVM | 0.949 |
+
+SCTN beats FFT band power on 24 of 24 patients (Wilcoxon p < 0.0001). The
+earlier result (FFT slightly ahead) came from per-minute peak scaling in the
+encoder, which removed the amplitude difference between classes.
+
+**Final test** (frozen protocol above, 36.3 h of unseen seizure-free EEG from
+545 recordings, alarm after 5 consecutive windows, scored once):
+
+| Model | Seizures detected | False alarms / h | Median delay |
+|---|---|---|---|
+| SVM, SCTN | 175/185 | 0.80 | 6 s |
+| SNN, SCTN (seeds 0 / 1 / 2) | 178 / 179 / 178 | 1.16 / 2.04 / 0.96 | 7 s |
+| SNN, binned spikes | 171/185 | 1.07 | 8 s |
+| SVM, FFT | 173/185 | 1.32 | 7 s |
+
+Most misses come from chb16 (4 to 10 of its 10 seizures, all models). False
+alarms concentrate in a few patients (chb07, chb12, chb14, chb24); FFT has 14 of
+its 48 in chb20. Cross-patient (leave one patient out) AUC is 0.83 for all
+models, so the detectors stay patient-specific.
+
+**Cost:** the SCTN front-end needs about 8.4e7 neuron updates per second against
+about 8.7e4 multiplications for the FFT (`src/cost_estimate.py`). The advantage
+claimed for SCTN must rest on hardware (multiplier-free, event-driven), not on
+operation count.
+
+Per-patient tables are in `analysis/stats/`.
 
 ## References
 
