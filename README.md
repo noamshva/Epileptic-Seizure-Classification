@@ -163,8 +163,9 @@ models, so the detectors stay patient-specific.
 
 **Cost:** the SCTN front-end needs about 8.4e7 neuron updates per second against
 about 8.7e4 multiplications for the FFT (`src/cost_estimate.py`). The advantage
-claimed for SCTN must rest on hardware (multiplier-free, event-driven), not on
-operation count.
+for SCTN is architectural, not operation count: it needs no multipliers and is
+event-driven, so it suits neuromorphic hardware. The power saving is a hypothesis
+here. Measuring it on a neuromorphic processor (e.g. NEMO, Technion) is future work.
 
 Per-patient tables are in `analysis/stats/`.
 
