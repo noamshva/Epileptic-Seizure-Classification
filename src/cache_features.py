@@ -17,11 +17,20 @@ With --bins it instead writes <data root>/dataset/bins_cache/<subject>.npz with:
 With --fft it writes <data root>/dataset/fft_cache/<subject>.npz with the FFT
 band-power baseline (X_band [n, 40]) on the same windows.
 
+With --gamma it writes <data root>/dataset/gamma_cache/<subject>.npz with the
+Gamma-band burstiness (X_res [n, 70], X_band [n, 10]) on the same windows.
+
+--peri (with SPIKES_ROOT = the encoder's PERI=1 folder) caches the non-seizure
+windows near seizures instead: guard-band minutes plus the seizure-free part of
+the seizure minutes in dataset/spikes_raw.
+
 Usage:
     python -u src/cache_features.py                # all encoded patients
     python -u src/cache_features.py chb01 chb03
     python -u src/cache_features.py --bins
     python -u src/cache_features.py --fft
+    python -u src/cache_features.py --gamma
+    SPIKES_ROOT=dataset/spikes_raw_peri python -u src/cache_features.py --peri [--fft]
 """
 from __future__ import annotations
 
@@ -37,23 +46,60 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import features as F                                                    # noqa: E402
 
 
-def cache_subject(subj: str, force: bool = False) -> tuple[str, int, float]:
-    out = F.cache_path(subj)
+def peri_windows(subj: str):
+    """Non-seizure windows near seizures, same fields as enumerate_windows plus 'root'."""
+    S = F._s2s
+    seizures = S._load_seizures_for_subjects([subj])
+    main = Path(F.SPIKES_ROOT).parent / "spikes_raw"
+    step = F.WINDOW_SECONDS * (1 - F.WINDOW_OVERLAP)
+    for trial in sorted(p.name for p in (Path(F.SPIKES_ROOT) / subj).iterdir() if p.is_dir()):
+        iv = seizures.get(trial, [])
+        for root, lab in ((Path(F.SPIKES_ROOT), "peri"), (main, "seizure")):
+            d = root / subj / trial / lab
+            if not d.is_dir():
+                continue
+            for minute in sorted(int(m.name) for m in d.iterdir()):
+                for off in np.arange(0, 60 - F.WINDOW_SECONDS + 1e-9, step):
+                    a = minute * 60 + float(off)
+                    if S._overlaps_any_seizure(a, a + F.WINDOW_SECONDS, iv):
+                        continue
+                    yield {"subject": subj, "trial": trial, "minute_label": lab, "minute": minute,
+                           "sec_offset_in_minute": float(off), "abs_start_s": a,
+                           "abs_end_s": a + F.WINDOW_SECONDS, "window_label": "non_seizure",
+                           "root": root}
+
+
+def _windows(subj: str, peri: bool):
+    return peri_windows(subj) if peri else F.enumerate_windows([subj], F.WINDOW_SECONDS, F.WINDOW_OVERLAP)
+
+
+def _minute_cache(caches: dict, win: dict, band_res=None):
+    root = win.get("root")
+    if root not in caches:
+        caches[root] = F.MinuteCache(capacity=1, band_resonators=band_res, root=root)
+    return caches[root]
+
+
+def cache_subject(subj: str, force: bool = False, peri: bool = False,
+                  gamma: bool = False) -> tuple[str, int, float]:
+    out = F.GAMMA_ROOT / f"{subj}.npz" if gamma else F.cache_path(subj)
     if out.is_file() and not force:
         return subj, -1, 0.0
     t0 = time.time()
-    cache = F.MinuteCache(capacity=1)
+    bands = ("Gamma",) if gamma else F.BANDS
+    band_res = {"Gamma": F.GAMMA_RESONATORS} if gamma else F.BAND_RESONATORS
+    caches: dict = {}
     X_res, X_band, y, g, start = [], [], [], [], []
-    for win in F.enumerate_windows([subj], F.WINDOW_SECONDS, F.WINDOW_OVERLAP):
+    for win in _windows(subj, peri):
         try:
-            bw = F.window_burstiness(win, cache)
+            bw = F.window_burstiness(win, _minute_cache(caches, win, band_res))
         except FileNotFoundError:
             continue
         res, band = [], []
         for ch in F.CHANNELS:
-            for b in F.BANDS:
+            for b in bands:
                 v = bw.get((ch, b))
-                n = len(F.BAND_RESONATORS[b])
+                n = len(band_res[b])
                 vals = [float(v[i]) if v is not None and i < len(v) else 0.0 for i in range(n)]
                 res.extend(vals)
                 band.append(float(np.mean(v)) if v is not None and len(v) else 0.0)
@@ -71,17 +117,17 @@ def cache_subject(subj: str, force: bool = False) -> tuple[str, int, float]:
     return subj, len(y), time.time() - t0
 
 
-def cache_subject_bins(subj: str, force: bool = False) -> tuple[str, int, float]:
+def cache_subject_bins(subj: str, force: bool = False, peri: bool = False) -> tuple[str, int, float]:
     out = F.BINS_ROOT / f"{subj}.npz"
     if out.is_file() and not force:
         return subj, -1, 0.0
     t0 = time.time()
-    cache = F.MinuteCache(capacity=1)
+    caches: dict = {}
     n_res = sum(len(F.BAND_RESONATORS[b]) for b in F.BANDS) * len(F.CHANNELS)
     X, y, g, start = [], [], [], []
-    for win in F.enumerate_windows([subj], F.WINDOW_SECONDS, F.WINDOW_OVERLAP):
+    for win in _windows(subj, peri):
         try:
-            bw = F.window_bins(win, cache)
+            bw = F.window_bins(win, _minute_cache(caches, win))
         except FileNotFoundError:
             continue
         x = np.zeros((F.N_BINS, n_res), np.int16)
@@ -104,7 +150,7 @@ def cache_subject_bins(subj: str, force: bool = False) -> tuple[str, int, float]
     return subj, len(y), time.time() - t0
 
 
-def cache_subject_fft(subj: str, force: bool = False) -> tuple[str, int, float]:
+def cache_subject_fft(subj: str, force: bool = False, peri: bool = False) -> tuple[str, int, float]:
     out = F.FFT_ROOT / f"{subj}.npz"
     if out.is_file() and not force:
         return subj, -1, 0.0
@@ -113,7 +159,7 @@ def cache_subject_fft(subj: str, force: bool = False) -> tuple[str, int, float]:
     n_win = int(round(F.WINDOW_SECONDS * F._FFT_FS))
     X, y, g, start = [], [], [], []
     trial, eeg = None, None
-    for win in F.enumerate_windows([subj], F.WINDOW_SECONDS, F.WINDOW_OVERLAP):
+    for win in _windows(subj, peri):
         if win["trial"] != trial:                      # one recording in memory at a time
             trial = win["trial"]
             eeg = F._load_eeg_per_trial([subj], only={trial}).get(trial)
@@ -144,13 +190,16 @@ def main():
     subjects = args or sorted(p.name for p in Path(F.SPIKES_ROOT).iterdir() if p.is_dir())
     bins = "--bins" in sys.argv
     fft = "--fft" in sys.argv
+    gamma = "--gamma" in sys.argv
+    peri = "--peri" in sys.argv
     fn = cache_subject_fft if fft else cache_subject_bins if bins else cache_subject
+    extra = (peri, True) if gamma else (peri,)
     print(f"Caching {len(subjects)} patients -> "
-          f"{F.FFT_ROOT if fft else F.BINS_ROOT if bins else F.CACHE_ROOT}", flush=True)
+          f"{F.FFT_ROOT if fft else F.BINS_ROOT if bins else F.GAMMA_ROOT if gamma else F.CACHE_ROOT}", flush=True)
     workers = min(int(os.environ.get("WORKERS", 3)), len(subjects))
     failed = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(fn, s, force): s for s in subjects}
+        futs = {ex.submit(fn, s, force, *extra): s for s in subjects}
         for f in as_completed(futs):
             try:
                 subj, n, dt = f.result()

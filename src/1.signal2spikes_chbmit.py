@@ -101,6 +101,9 @@ SEIZURE_FREE = os.environ.get("SEIZURE_FREE", "0") == "1"   # instead: only seiz
 FREE_MINUTES = int(os.environ.get("FREE_MINUTES", 2))       # minutes taken from a seizure-free recording
 # FREE_SEED set: per-recording random minutes, never the ones the default draw takes.
 FREE_SEED = os.environ.get("FREE_SEED")
+# PERI=1: encode only the guard-band minutes around seizures (label "peri"), for testing near seizures.
+PERI = os.environ.get("PERI", "0") == "1"
+PERI_CHUNK = 3                    # guard minutes encoded per pass (bounds memory)
 
 # Notebook/CLI override: PIPELINE_SUBJECTS="chb01,chb02" scopes the run.
 if os.environ.get("PIPELINE_SUBJECTS"):
@@ -439,6 +442,7 @@ def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, 
 
     seizure_minutes = []
     interictal_minutes = []
+    guard_minutes = []
     for m in range(max_minutes):
         m_start, m_end = m * 60, (m + 1) * 60
         in_seizure = any(
@@ -452,7 +456,8 @@ def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, 
             for (s, e) in seizure_intervals_sec
         )
         if in_guard:
-            continue  # pre/post-ictal — exclude entirely
+            guard_minutes.append(m)   # pre/post-ictal — excluded unless PERI
+            continue
         interictal_minutes.append(m)
 
     # Per-EDF class balance: subsample non-seizure minutes to match seizure count.
@@ -483,6 +488,10 @@ def get_minutes_with_labels(n_samples: int, fs_: int, seizure_intervals_sec, *, 
         "seizure": seizure_minutes,
         "non_seizure": chosen_non_seizure,
     }
+
+    if PERI:
+        print(f"  Guard-band minutes ({len(guard_minutes)}): {guard_minutes}")
+        return {"peri": guard_minutes}
 
     if seizure_intervals_sec:
         print(f"  Seizure intervals (seconds): {seizure_intervals_sec}")
@@ -574,7 +583,13 @@ def process_file(subject: str,
     print(f"\n>>> {subject}/{edf_file} | samples={n_samples:,} | minutes: seizure={n_seiz} non_seizure={n_non}")
 
     if USE_FAST_KERNEL:
-        _process_file_fast(subject, edf_file, df, minute_labels, n_samples, log_every)
+        if PERI:
+            mins = minute_labels["peri"]
+            for i in range(0, len(mins), PERI_CHUNK):
+                _process_file_fast(subject, edf_file, df, {"peri": mins[i:i + PERI_CHUNK]},
+                                   n_samples, log_every)
+        else:
+            _process_file_fast(subject, edf_file, df, minute_labels, n_samples, log_every)
         return
 
     # Encode channels in batches so the process pool stays saturated: each

@@ -94,6 +94,7 @@ def load_cached(subject: str, feature_level: str = "band"):
 
 BINS_ROOT = Path(SPIKES_ROOT).parent / f"bins_cache{_SFX}"
 FFT_ROOT = Path(SPIKES_ROOT).parent / f"fft_cache{_SFX}"
+GAMMA_ROOT = Path(SPIKES_ROOT).parent / f"gamma_cache{_SFX}"
 
 
 def load_bins(subject: str):
@@ -162,8 +163,9 @@ class MinuteCache:
     resonator at its native clock rate.
     """
 
-    def __init__(self, capacity: int = 8, band_resonators: dict | None = None):
+    def __init__(self, capacity: int = 8, band_resonators: dict | None = None, root=None):
         self.capacity = capacity
+        self.root = Path(root or SPIKES_ROOT)
         self.band_resonators = band_resonators or BAND_RESONATORS
         self._store: dict = {}
 
@@ -171,7 +173,7 @@ class MinuteCache:
         key = (subject, trial, minute_label, minute)
         if key in self._store:
             return self._store[key]
-        minute_dir = Path(SPIKES_ROOT) / subject / trial / minute_label / str(minute)
+        minute_dir = self.root / subject / trial / minute_label / str(minute)
         per_ch_band: dict[tuple[str, str], list[tuple[int, np.ndarray]]] = {}
         for ch in CHANNELS:
             ch_dir = minute_dir / ch

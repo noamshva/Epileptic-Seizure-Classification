@@ -22,6 +22,7 @@ Env:
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import time
@@ -134,8 +135,22 @@ def _bin_stats(X, idx, chunk: int = 256):
     return torch.tensor(mu, dtype=torch.float32), torch.tensor(sd, dtype=torch.float32)
 
 
-def fit_predict(X, y, tr, te, seed: int = SEED):
-    """Train on windows tr; return (P(seizure), label, hidden rate, final train loss) for te."""
+def _quantized(net, bits: int):
+    """Copy of net with every parameter tensor rounded to `bits`-bit signed levels."""
+    q = copy.deepcopy(net)
+    with torch.no_grad():
+        for p in q.parameters():
+            step = p.abs().max() / (2 ** (bits - 1) - 1)
+            if step > 0:
+                p.copy_(torch.round(p / step) * step)
+    return q
+
+
+def fit_predict(X, y, tr, te, seed: int = SEED, quant_bits=()):
+    """Train on windows tr; return (P(seizure), label, hidden rate, final train loss) for te.
+
+    quant_bits: also return {bits: P(seizure)} from the weights quantized after training.
+    """
     torch.manual_seed(seed)
     if X.ndim == 3:
         mu, sd = _bin_stats(X, tr)
@@ -170,15 +185,21 @@ def fit_predict(X, y, tr, te, seed: int = SEED):
                 nn.utils.clip_grad_norm_(net.parameters(), CLIP)
             opt.step()
 
-    net.eval()
-    rates, hids = [], []
-    with torch.no_grad():
-        for i in range(0, len(te_t), 512):
-            rate, hid = net(batch(te_t[i:i + 512]))
-            rates.append(rate); hids.append(float(hid) * rate.shape[0])
-    rate = torch.cat(rates)
+    def infer(model):
+        model.eval()
+        rates, hids = [], []
+        with torch.no_grad():
+            for i in range(0, len(te_t), 512):
+                rate, hid = model(batch(te_t[i:i + 512]))
+                rates.append(rate); hids.append(float(hid) * rate.shape[0])
+        return torch.cat(rates), sum(hids) / len(te_t)
+
+    rate, hid = infer(net)
     prob = torch.softmax(rate, dim=1)[:, 1].numpy()
-    return prob, rate.argmax(dim=1).numpy(), sum(hids) / len(te_t), float(np.mean(losses))
+    out = (prob, rate.argmax(dim=1).numpy(), hid, float(np.mean(losses)))
+    if quant_bits:
+        out += ({b: torch.softmax(infer(_quantized(net, b))[0], dim=1)[:, 1].numpy() for b in quant_bits},)
+    return out
 
 
 def run_patient(subj: str):
