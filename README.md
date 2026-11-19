@@ -137,7 +137,9 @@ faster and bit-identical** to the on-disk spikes — which makes encoding the fu
 | FFT band power + SVM | 0.932 |
 | FFT band power, clipped at 100 µV, + SVM | 0.949 |
 
-SCTN beats FFT band power on 24 of 24 patients (Wilcoxon p < 0.0001). The
+SCTN beats FFT band power on 24 of 24 patients (Wilcoxon p < 0.0001). At a 200 µV
+full scale SCTN drops to 0.953 and still beats FFT clipped at 200 µV (0.940,
+20 of 24 patients, p = 0.0006) (`analysis/stats/scale_robustness_200uv.csv`). The
 earlier result (FFT slightly ahead) came from per-minute peak scaling in the
 encoder, which removed the amplitude difference between classes.
 
@@ -150,6 +152,9 @@ encoder, which removed the amplitude difference between classes.
 | SNN, SCTN (seeds 0 / 1 / 2) | 178 / 179 / 178 | 1.16 / 2.04 / 0.96 | 7 s |
 | SNN, binned spikes | 171/185 | 1.07 | 8 s |
 | SVM, FFT | 173/185 | 1.32 | 7 s |
+
+95% patient-bootstrap intervals (`src/fa_ci.py`): SVM SCTN 0.34 to 1.38/h, SVM FFT
+0.63 to 2.30/h. The SCTN vs FFT detector difference is not significant on 36 h.
 
 Most misses come from chb16 (4 to 10 of its 10 seizures, all models). False
 alarms concentrate in a few patients (chb07, chb12, chb14, chb24); FFT has 14 of
