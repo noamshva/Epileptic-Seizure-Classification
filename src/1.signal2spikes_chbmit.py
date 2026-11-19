@@ -127,7 +127,7 @@ CHANNELS_PER_BATCH = 2
 
 # Fast-path (Numba) parallelism: encode this many recordings concurrently, each
 # in its own process. Recordings are independent, so this is a clean fan-out.
-FAST_MAX_WORKERS = min(8, max(1, (os.cpu_count() or 2) - 2))
+FAST_MAX_WORKERS = int(os.environ.get("ENCODE_WORKERS", 0)) or min(8, max(1, (os.cpu_count() or 2) - 2))
 
 # ======== BIPOLAR CHANNEL SELECTION ========
 # 10-channel set used for verification on the sa-aligned branch.
