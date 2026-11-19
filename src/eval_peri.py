@@ -6,6 +6,9 @@ the other seizure recordings plus all of <SPIKES_ROOT>_free, then score the
 held-out recording's windows near its seizures. Alarm = ALARM_RUN consecutive
 flagged windows, placed at the window that completes it.
 
+Control (zone "bg"): the same fold models on the held-out recording's sampled
+non-seizure minutes, all at least 5 min from any seizure.
+
 Needs: SPIKES_ROOT=dataset/spikes_raw_peri python src/cache_features.py --peri [--fft]
 Writes analysis/stats/peri_<model>_k<K>.csv (per patient),
 peri_profile_<model>_k<K>.csv (by distance from the seizure) and per-window
@@ -34,6 +37,7 @@ import eval_false_alarms as E                                           # noqa: 
 
 K = E.ALARM_RUN
 EDGES = (0, 60, 120, 180, 240, 300, np.inf)        # seconds from the seizure
+COLS = ["windows", "flagged", "alarms"]
 WIN_PER_HOUR = 59 * 60
 
 
@@ -63,31 +67,36 @@ def _alarm_idx(flag, seg, order):
 
 
 def run_patient(subj):
-    X, y, g, _ = E._load(subj)
+    X, y, g, s = E._load(subj)
     Xf, yf, _, _ = E._load(subj, "_free")
     Xp, yp, gp, sp = E._load(subj, "_peri")
     Xa = np.concatenate([X, Xf, Xp]); ya = np.concatenate([y, yf, yp])
-    extra = len(y) + np.arange(len(yf)); off = len(y) + len(yf)
+    extra = len(y) + np.arange(len(yf))
+    b = np.flatnonzero(y == 0)
+    src = np.concatenate([len(y) + len(yf) + np.arange(len(yp)), b])
+    gp, sp = np.concatenate([gp, g[b]]), np.concatenate([sp, s[b]])
+    bg = np.arange(len(src)) >= len(yp)
 
-    pred = np.zeros(len(yp), int); score = np.full(len(yp), np.nan)
+    pred = np.zeros(len(src), int); score = np.full(len(src), np.nan)
     for tr, te in LeaveOneGroupOut().split(X, y, groups=g):
         idx = np.flatnonzero(gp == g[te][0])
         if len(idx) and len(set(y[tr].tolist())) == 2:
-            pred[idx], score[idx] = E._predict(Xa, ya, np.concatenate([tr, extra]), off + idx)
+            pred[idx], score[idx] = E._predict(Xa, ya, np.concatenate([tr, extra]), src[idx])
 
     ok = ~np.isnan(score)
-    gp, sp, pred, score = gp[ok], sp[ok], pred[ok], score[ok]
+    gp, sp, pred, score, bg = gp[ok], sp[ok], pred[ok], score[ok], bg[ok]
     rel = _rel(subj, gp, sp)
     seg, order = E._segments(gp, sp)
     alarm = np.zeros(len(gp), bool); alarm[_alarm_idx(pred == 1, seg, order)] = True
 
     sdir = E._OUT / f"fa_scores_peri_{E.NAME}"; sdir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(sdir / f"{subj}.npz", g=gp, st=sp, score=score, pred=pred, rel=rel)
+    np.savez_compressed(sdir / f"{subj}.npz", g=gp, st=sp, score=score, pred=pred, rel=rel, bg=bg)
 
-    rows = []
+    rows = [{"patient": subj, "zone": "bg", "from_s": 300, "windows": int(bg.sum()),
+             "flagged": int(pred[bg].sum()), "alarms": int(alarm[bg].sum())}]
     for zone, sign in (("pre", -1), ("post", 1)):
         for lo, hi in zip(EDGES[:-1], EDGES[1:]):
-            m = (np.sign(rel) == sign) & (np.abs(rel) >= lo) & (np.abs(rel) < hi)
+            m = ~bg & (np.sign(rel) == sign) & (np.abs(rel) >= lo) & (np.abs(rel) < hi)
             rows.append({"patient": subj, "zone": zone, "from_s": lo, "windows": int(m.sum()),
                          "flagged": int(pred[m].sum()), "alarms": int(alarm[m].sum())})
     return rows
@@ -102,28 +111,31 @@ def main():
     with ProcessPoolExecutor(max_workers=workers) as ex:
         for fut in as_completed([ex.submit(run_patient, s) for s in patients]):
             r = fut.result(); rows += r
-            n = sum(x["windows"] for x in r); a = sum(x["alarms"] for x in r)
-            print(f"  {r[0]['patient']}: {n / WIN_PER_HOUR:.2f} h | alarms {a}", flush=True)
+            n = sum(x["windows"] for x in r[1:]); a = sum(x["alarms"] for x in r[1:])
+            print(f"  {r[0]['patient']}: near {n / WIN_PER_HOUR:.2f} h, alarms {a} | "
+                  f"bg {r[0]['windows'] / WIN_PER_HOUR:.2f} h, alarms {r[0]['alarms']}", flush=True)
     df = pd.DataFrame(rows).sort_values(["patient", "zone", "from_s"])
-    df["far"] = df.from_s >= 60
+    near = df.zone != "bg"
+    df["far"] = near & (df.from_s >= 60)
 
     def rate(d):
         h = d.windows.sum() / WIN_PER_HOUR
         return pd.Series({"hours": h, "win_fpr": d.flagged.sum() / max(d.windows.sum(), 1),
                           "alarms": d.alarms.sum(), "alarms_per_h": d.alarms.sum() / h if h else np.nan})
 
-    prof = df.groupby(["zone", "from_s"]).apply(rate).reset_index()
-    pat = pd.concat({"all": df.groupby("patient").apply(rate),
-                     "far": df[df.far].groupby("patient").apply(rate)}, axis=1)
+    prof = df.groupby(["zone", "from_s"])[COLS].apply(rate).reset_index()
+    pat = pd.concat({k: d.groupby("patient")[COLS].apply(rate)
+                     for k, d in (("all", df[near]), ("far", df[df.far]), ("bg", df[~near]))}, axis=1)
     pat.columns = [f"{b}_{a}" for a, b in pat.columns]
     tag = f"{E.NAME}_k{K}"
     pat.reset_index().to_csv(E._OUT / f"peri_{tag}.csv", index=False)
     prof.to_csv(E._OUT / f"peri_profile_{tag}.csv", index=False)
 
     print(prof.round(3).to_string(index=False))
-    for name, d in (("all windows near seizures", df), ("more than 1 min from a seizure", df[df.far]),
+    for name, d in (("all windows near seizures", df[near]), ("more than 1 min from a seizure", df[df.far]),
                     ("before onset, more than 1 min", df[df.far & (df.zone == "pre")]),
-                    ("after end, more than 1 min", df[df.far & (df.zone == "post")])):
+                    ("after end, more than 1 min", df[df.far & (df.zone == "post")]),
+                    ("same recordings, sampled minutes 5+ min away (bg)", df[~near])):
         r = rate(d)
         print(f"{name}: {r.hours:.1f} h | window FPR {r.win_fpr:.4f} | alarms {int(r.alarms)}"
               f" = {r.alarms_per_h:.2f}/h")

@@ -72,3 +72,5 @@ encoding_*.log
 
 dataset/fft_cache*/
 backups/
+
+dataset/gamma_cache*/

@@ -161,6 +161,53 @@ alarms concentrate in a few patients (chb07, chb12, chb14, chb24); FFT has 14 of
 its 48 in chb20. Cross-patient (leave one patient out) AUC is 0.83 for all
 models, so the detectors stay patient-specific.
 
+**Additional tests** (run after the final test, none of them uses the final test data):
+
+*Gamma band* (`src/svm_feature_sets.py`). Adding the 7 Gamma resonators per
+channel does not help: 50-D 0.962 against 0.962 for 40-D (p = 0.90), 350-D 0.965
+against 0.967 for 280-D (p = 0.68). Gamma alone gives 0.920. SCTN stays ahead of
+FFT on 24 of 24 patients with Gamma included.
+
+*Weight precision* (`src/snn_quantization.py`). Trained SNN weights rounded to N
+bits with no retraining, seed 0, mean AUC:
+
+| Weights | Full | 8 bits | 6 bits | 5 bits | 4 bits | 3 bits | 2 bits |
+|---|---|---|---|---|---|---|---|
+| SNN, 40 SCTN features | 0.958 | 0.958 | 0.958 | 0.957 | 0.955 | 0.938 | 0.694 |
+| SNN, binned spikes | 0.941 | 0.941 | 0.941 | 0.940 | 0.935 | 0.913 | 0.755 |
+
+Both models keep their accuracy down to 5 bits. At 4 bits the mean loss is not
+significant, but one patient (chb12, binned spikes) loses 0.11. The loss at 3
+bits is significant (p = 0.003 and p = 0.0004). Leak and threshold were not rounded.
+
+*False alarms near seizures* (`src/eval_peri.py`, `src/eval_free_unseen.py`,
+`src/fa_context_ci.py`). The 5 minutes on each side of every seizure are excluded
+from training and from the final test. They were encoded separately (30.2 h with
+the seizure-free part of the seizure minutes) and scored leave-one-recording-out
+with the frozen detector. False alarms per hour:
+
+| EEG scored | Hours | SVM, SCTN | SNN, SCTN (seed 0) | SVM, FFT |
+|---|---|---|---|---|
+| Final test (seizure-free recordings) | 36.3 | 0.80 | 1.16 | 1.32 |
+| Seizure-free recordings not seen in training | 18.2 | 1.21 | 1.98 | 2.64 |
+| Seizure recordings, at least 5 min from a seizure | 5.9 | 3.05 | 4.75 | 4.41 |
+| 1 to 5 min before onset | 12.4 | 4.45 | 2.67 | 2.43 |
+| Last minute before onset | 3.1 | 11.4 | 10.7 | 9.8 |
+| First minute after the end | 3.0 | 35.2 | 37.5 | 25.0 |
+| 1 to 5 min after the end | 11.7 | 11.6 | 10.2 | 9.2 |
+
+All three detectors keep alarming after a seizure ends. With the SVM, 67 of 185
+seizures have an alarm in the minute after the annotated end, and the rate stays
+raised for about 3 minutes. Before onset only the last minute is raised (27 of
+185 seizures). The final-test rate is therefore an interictal rate. On
+seizure-free recordings not seen in training the rate is 1.5 to 2 times the
+final-test rate (not significant for any model). The higher rate in seizure
+recordings away from seizures rests on 5.9 h and is not significant once the
+patient mix is matched (p = 0.51 SVM, 0.08 SNN, 0.09 FFT). SCTN with the SVM has
+fewer false alarms than FFT on unseen seizure-free recordings (difference
+-1.42/h, 95% interval -3.08 to -0.12) and more in the first minute after a
+seizure (+10.1/h, 3.7 to 15.8).
+
 **Cost:** the SCTN front-end needs about 8.4e7 neuron updates per second against
 about 8.7e4 multiplications for the FFT (`src/cost_estimate.py`). The advantage
 for SCTN is architectural, not operation count: it needs no multipliers and is
