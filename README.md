@@ -4,29 +4,31 @@
 
 Seizure vs. non-seizure classification from CHB-MIT scalp EEG using a
 **neuromorphic SCTN resonator front-end** (Spike Continuous-Time Neurons)
-instead of classical FFT band-power features, classified by standard machine
-learning (SVM / Random Forest). The resonator encoding is adapted from the
-situational-awareness work of Hadad et al. (2024).
+compared with classical FFT band-power features. The features are classified by
+an SVM and by a spiking neural network (SNN). The resonator encoding is adapted
+from the situational-awareness work of Hadad et al. (2024).
 
 The project asks: *can a spike-based, multiplier-free front-end match classical
-FFT features for seizure detection?* — and answers it with a leakage-free,
-multi-patient comparison.
+FFT features for seizure detection?* It answers with a leakage-free comparison
+on all 24 CHB-MIT patients and a detector test on unseen recordings (see Results).
 
 ## Pipeline
 
 ```
 EEG raw ──▶ SCTN resonator bank ──▶ burstiness features ──▶ classifier
- (256 Hz)    (per channel, per       (std of 10-ms binned     (SVM / RF)
+ (256 Hz)    (per channel, per       (std of 10-ms binned     (SVM / SNN)
              band; spike trains)      spike density → 40-D)
-   1.signal2spikes        features.py            2.analyze / 3.run_classify
+   1.signal2spikes        features.py            2.analyze / 3, 3c.run_classify
 ```
 
 1. **Encode** — each channel is band-pass filtered and run through a bank of SCTN
    resonators tuned across EEG sub-bands; their spike trains are written to disk.
 2. **Feature** — per 2-s window, the discriminative feature is *burstiness*
    (std of the 10-ms-binned spike density) per (channel, band) → a 40-D vector.
-3. **Analyze / Classify** — visualize SCTN vs. FFT (paper Figs 4/6/7), and
-   classify with an SVM / Random Forest under honest leave-one-recording-out CV.
+3. **Analyze / Classify**: visualize SCTN vs. FFT (paper Figs 4/6/7), and
+   classify with an SVM or an SNN under leave-one-recording-out CV.
+4. **Detect**: a frozen detector protocol (alarm after 5 consecutive flagged
+   windows) scored for sensitivity, false alarms per hour and detection delay.
 
 ## Repository layout
 
@@ -36,11 +38,19 @@ EEG raw ──▶ SCTN resonator bank ──▶ burstiness features ──▶ cl
 | [src/features.py](src/features.py) | Shared feature extraction: SCTN burstiness (40-D band / 280-D resonator, ±Gamma) + FFT baselines (band-power / fine PSD) |
 | [src/2.analyze_chbmit.py](src/2.analyze_chbmit.py) | **Analyze** — SCTN-vs-FFT spectrograms, per-channel grids, topography (mirrors the SA paper's Figs 4/6/7) for one example recording |
 | [src/3.run_classify_chbmit.py](src/3.run_classify_chbmit.py) | **Classify** — SVM on burstiness features; per-patient LORO + stratified, confusion matrix |
-| [src/3b.run_classify_rf_chbmit.py](src/3b.run_classify_rf_chbmit.py) | Same harness with a Random Forest |
+| [src/3b.run_classify_rf_chbmit.py](src/3b.run_classify_rf_chbmit.py) | Same harness with a Random Forest (check only, not reported) |
+| [src/3c.run_classify_snn_chbmit.py](src/3c.run_classify_snn_chbmit.py) | **Classify** with a three-layer SNN (surrogate gradient), on the 40 features or on binned spikes (`INPUT=bins`) |
+| [src/cache_features.py](src/cache_features.py) | Cache features per patient (`--bins`, `--fft`, `--gamma`, `--peri`) |
+| [src/compare_fft_vs_sctn.py](src/compare_fft_vs_sctn.py) | FFT vs SCTN window AUC per patient, with Wilcoxon tests |
+| [src/svm_feature_sets.py](src/svm_feature_sets.py) | SVM AUC for the feature sets with and without Gamma |
+| [src/eval_false_alarms.py](src/eval_false_alarms.py) | Detector test: sensitivity and false alarms per hour (`FINAL=1` for the final test) |
+| [src/detection_delay.py](src/detection_delay.py), [src/fa_tradeoff.py](src/fa_tradeoff.py), [src/fa_ci.py](src/fa_ci.py) | Detection delay, sensitivity against false alarms, confidence intervals |
+| [src/eval_peri.py](src/eval_peri.py), [src/eval_free_unseen.py](src/eval_free_unseen.py), [src/fa_context_ci.py](src/fa_context_ci.py) | False alarms near seizures and on unseen recordings, with intervals |
+| [src/cross_patient.py](src/cross_patient.py) | Leave-one-patient-out test |
+| [src/snn_quantization.py](src/snn_quantization.py) | SNN accuracy with weights rounded to N bits |
+| [src/cost_estimate.py](src/cost_estimate.py) | Operation counts, SCTN front-end vs FFT |
 | [src/sctn_fast.py](src/sctn_fast.py) | Numba `@njit` reimplementation of the resonator forward pass (~1000× faster, bit-identical) |
-| [src/run_pipeline.ipynb](src/run_pipeline.ipynb) | One notebook driving encode → analyze → classify (local or Colab) |
-
-*(An SNN classifier lives on a separate branch; `main` is the classical-classifier pipeline.)*
+| [src/run_pipeline.ipynb](src/run_pipeline.ipynb) | Notebook driving encode → analyze → SVM classify (local or Colab) |
 
 ## Setup
 
@@ -77,7 +87,8 @@ encoding + classification run on all.
 python src/1.signal2spikes_chbmit.py                        # encode (env PIPELINE_SUBJECTS scopes it)
 python src/2.analyze_chbmit.py                              # SCTN-vs-FFT figures → analysis/
 python src/3.run_classify_chbmit.py  chb01 chb02 ...        # SVM, per patient → output_data/results/
-python src/3b.run_classify_rf_chbmit.py chb01 chb02 ...     # Random Forest
+python src/3c.run_classify_snn_chbmit.py chb01 chb02 ...    # SNN (needs: python src/cache_features.py)
+FINAL=1 ALARM_RUN=5 python src/eval_false_alarms.py svm     # detector test (svm | fft | snn)
 ```
 
 The numbered/dotted filenames run as scripts (`python src/1.signal2spikes_chbmit.py`);
@@ -96,7 +107,7 @@ cross-file imports use `importlib`, so nothing needs to be importable as a modul
 | Window | 2 s, 50 % overlap (Shoeb 2010) |
 | Feature | burstiness = std of 10-ms-binned spike density, mean per (channel, band) → 40-D |
 | Guard band | 5 min around each seizure; interictal pool subsampled to match seizure-minute count per EDF |
-| Classifiers | SVM-RBF (C=1, γ=scale, class-balanced) · Random Forest (300 trees) |
+| Classifiers | SVM-RBF (C=1, γ=scale, class-balanced) · SNN (encoder, 64 hidden LIF neurons, output) |
 | Evaluation | leave-one-recording-out (honest) + stratified 5-fold (leaky, for reference) |
 
 ## Frozen detector protocol (fixed 2026-11-17, before the final test data was scored)
